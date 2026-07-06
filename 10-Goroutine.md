@@ -1,6 +1,6 @@
 ## 第10章 Goroutine（重点）
 
-> 引言：Goroutine 是 Go 语言并发模型的灵魂。它以极低的创建与切换成本支撑了"百万并发"的工程神话，而这一神话的底层支柱是 Go Runtime 的 GMP 调度器。本章将从调度器整体设计出发，逐个拆解 M、P、G 三大核心实体，串起 GMP 协同模型，再深入 work stealing、抢占调度、syscall、netpoll 这些让 goroutine "跑得稳、跑得快、跑得不被饿死"的关键机制。理解本章，是理解 [第11章 Channel](./11-Channel.md) 与 [第12章 并发原语](./12-Sync.md) 的前置基础。
+> 引言：Goroutine 是 Go 语言并发模型的灵魂。它以极低的创建与切换成本支撑了"百万并发"的工程神话，而这一神话的底层支柱是 Go Runtime 的 GMP 调度器。本章将从调度器整体设计出发，逐个拆解 M、P、G 三大核心实体，串起 GMP 协同模型，再深入 work stealing、抢占调度、syscall、netpoll 这些让 goroutine "跑得稳、跑得快、跑得不被饿死"的关键机制。理解本章，是理解 [第11章 Channel](./11-Channel.md) 与 [第12章 select](./12-select.md) 的前置基础。
 
 ---
 
