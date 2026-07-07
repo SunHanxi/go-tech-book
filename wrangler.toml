@@ -1,0 +1,12 @@
+name = "go-tech-book"
+compatibility_date = "2024-11-01"
+
+# mdBook 构建产物目录,作为静态资源托管
+[assets]
+directory = "./book"
+not_found_handling = "404-page"
+
+# 绑定自定义域名(需要 bringwater.top 已经接入 Cloudflare)
+[[routes]]
+pattern = "gobook.bringwater.top"
+custom_domain = true
