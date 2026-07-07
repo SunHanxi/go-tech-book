@@ -1,6 +1,6 @@
 # 《Go 底层原理与工程实践》
 
-[![Deploy mdBook](https://github.com/SunHanxi/go-tech-book/actions/workflows/deploy.yml/badge.svg)](https://github.com/SunHanxi/go-tech-book/actions/workflows/deploy.yml)
+[![Live on Cloudflare Workers](https://img.shields.io/badge/Live-gobook.bringwater.top-F38020?logo=cloudflare&logoColor=white)](https://gobook.bringwater.top)
 
 > 一本从语言设计、Runtime、标准库到 Kubernetes 工程实践的 Go 原理书。
 
