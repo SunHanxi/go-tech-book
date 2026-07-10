@@ -1,6 +1,6 @@
 ## 第17章 sync 包
 
-> 引言：`sync` 包是 Go 并发的"显式同步"工具箱，与 channel 的"通信式同步"互补。它提供 `Mutex` / `RWMutex`（互斥）、`Once`（单次执行）、`Cond`（条件变量）、`WaitGroup`（等待组）、`Pool`（对象复用）、`atomic`（原子操作）。这些原语直接对接 Runtime 的信号量与自旋机制，性能远超 channel，但用错代价惨重（死锁、内存破坏、可见性问题）。本章逐个剖析其底层数据结构、状态机与工程陷阱。
+> 引言：`sync` 包是 Go 并发的显式同步工具箱，与 channel 的通信式同步互补。它提供 `Mutex`、`RWMutex`、`Once`、`Cond`、`WaitGroup`、`Pool`，`sync/atomic` 则提供原子操作。两类工具表达的问题不同，不能用“谁一定更快”选型。本章公共语义基于 Go 1.26；内部结构只用于理解，不是兼容性承诺。
 
 ### Mutex
 
@@ -448,13 +448,14 @@ func (c *Cond) Wait() {
 ```go
 type WaitGroup struct {
     noCopy noCopy
-    state atomic.Uint64 // 高 32 位 = 计数；低 32 位 = 等待者数
+    state atomic.Uint64 // 高32位=计数；bit31=synctest；低31位=等待者
     sema  uint32        // 信号量，阻塞 Wait
 }
 
 func (wg *WaitGroup) Add(delta int)
 func (wg *WaitGroup) Done()
 func (wg *WaitGroup) Wait()
+func (wg *WaitGroup) Go(f func()) // Go 1.25+
 ```
 
 典型用法：
@@ -486,13 +487,13 @@ func main() {
 ```go
 type WaitGroup struct {
     noCopy noCopy
-    state atomic.Uint64 // 高32位=counter，低32位=waiter
+    state atomic.Uint64 // 高32位=counter，低31位=waiter，中间1位供 synctest
     sema  uint32
 }
 ```
 
 字段解释：
-- `state`：64 位打包两个 32 位值。高 32 位是**计数器**（待完成 goroutine 数），低 32 位是**等待者数**（调用 Wait 阻塞的 goroutine 数）。
+- `state`：高 32 位是计数器，低 31 位是等待者数，剩余一位用于 Go 1.25+ `testing/synctest` 的 bubble 关联。业务代码不应依赖这套布局。
 - `sema`：信号量。Wait 把 waiter+1，若 counter>0 则 `runtime_Semacquire` 阻塞；Add 让 counter 归零时 `runtime_Semrelease` 唤醒所有 waiter。
 - `noCopy`：禁止复制（`go vet` 检测）。
 
@@ -501,7 +502,7 @@ type WaitGroup struct {
 func (wg *WaitGroup) Add(delta int) {
     state := wg.state.Add(uint64(delta) << 32)
     v := int32(state >> 32)      // counter
-    w := uint32(state)           // waiter
+    w := uint32(state & 0x7fffffff) // waiter，排除 synctest 标志
     if v < 0 {
         panic("sync: negative WaitGroup counter")
     }
@@ -670,7 +671,7 @@ func SwapInt32(addr *int32, new int32) int32
 func CompareAndSwapInt32(addr *int32, old, new int32) bool
 ```
 
-Go 1.19+ 新增类型安全的 `atomic.Int32` / `Int64` / `Uint32` / `Uint64` / `Bool` / `Pointer[T]`，避免手传 `*int32` 的易错。
+Go 1.19+ 新增类型安全的 `atomic.Int32` / `Int64` / `Uint32` / `Uint64` / `Bool` / `Pointer[T]`，避免手传裸指针。Go 1.23 又为整数原子类型增加 `And` / `Or`，适合原子位标志；跨多个字段的不变量仍应使用锁或整体发布不可变快照。
 
 ```go
 package main
@@ -699,7 +700,7 @@ func main() {
 **为什么这样设计 / 底层实现**
 
 1. **CPU 原子指令**：`CompareAndSwap` 对应 x86 的 `LOCK CMPXCHG`，ARM 的 `LDREX/STREX`。单条指令原子完成"比较+交换"，无需锁。
-2. **内存屏障**：原子操作附带内存屏障，保证可见性顺序。`Load` 是 acquire（后续读写不重排到它之前），`Store` 是 release（之前读写不重排到它之后）。
+2. **内存顺序**：Go 原子操作表现为处于某个全局顺序一致（sequentially consistent）顺序。若原子操作 A 的效果被 B 观察到，则 A synchronized-before B。不要把 C/C++ 的可选 relaxed/acquire/release API 模型直接套到 Go。
 3. **`atomic.Value` / `atomic.Pointer[T]`**：用于原子读写"任意类型"或泛型指针，常做无锁配置热更新。
 
 ```go
