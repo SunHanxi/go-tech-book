@@ -213,7 +213,7 @@ func (rw *RWMutex) Lock() {
    rw.RLock()
    rw.Lock() // 死锁
    ```
-3. **递归读锁不安全**：同 goroutine 两次 RLock 看似无碍，但若期间有写者到达，第二次 RUnlock 可能让 readerCount 提前归零唤醒写者，而第一次还没 RUnlock，造成写者读到不一致数据。**RWMutex 不可重入**。
+3. **不要递归获取读锁**：若两次 `RLock` 之间有写者等待，第二次 `RLock` 会阻塞；同一 goroutine 因而无法执行第一次 `RUnlock`，形成死锁。`RWMutex` 不可重入，也不应把读锁升级为写锁。
 4. **写少读多才划算**：纯写场景 RWMutex 比 Mutex 慢（状态更复杂）。基准测试后选择。
 5. **禁止复制**：同 Mutex。
 
@@ -304,7 +304,7 @@ func (o *Once) doSlow(f func()) {
 
 **工程实践与常见坑**
 
-1. **`f` panic 后 `done` 不会置 1**：`defer o.done.Store(1)` 在 `f()` 返回后才执行；若 f panic 且未 recover，store 不执行，后续 Do 会再调 f。可用 `OnceFunc` / `OnceValue`（Go 1.21+）获得更安全的行为。
+1. **`f` panic 后 Once 仍视为已执行**：`defer o.done.Store(1)` 在 panic 展开栈时仍会执行，首次调用者看到 panic，后续 `Do` 不会再调用 f。`OnceFunc` / `OnceValue` / `OnceValues`（Go 1.21+）会让后续调用重放同一个 panic，语义不同。
 2. **`f` 内不要再调同一个 Once 的 Do**：递归调用死锁（持锁状态下再次 Lock）。
 3. **Once 不能复用**：执行一次后永久"已完成"，无法 Reset。需要重复初始化用 `sync.Once` + 标志位或 `atomic.Pointer`。
 4. **Go 1.21+ 的 `OnceFunc` / `OnceValue` / `OnceValues`**：封装常见模式，避免手写 Once。
@@ -539,7 +539,7 @@ func (wg *WaitGroup) Add(delta int) {
 2. **计数不能为负**：`Add` 负值使 counter<0 会 panic。确保 Add 的总数与 Done 次数匹配。
 3. **禁止复制**：复制会分裂状态，`go vet` 报错。
 4. **WaitGroup 不能复用除非归零**：在 Wait 返回前不要重新 Add 正值（行为未定义）。复用应在 Wait 返回后。
-5. **Go 1.20+ 的 `WaitGroup.Go`**：简化 `Add(1); go f()` 模式。
+5. **Go 1.25+ 的 `WaitGroup.Go`**：简化 `Add(1); go f()` 模式。传入函数必须不 panic；需要错误传播时使用 `errgroup` 或显式结果 channel。
    ```go
    var wg sync.WaitGroup
    for i := 0; i < 5; i++ {
@@ -708,7 +708,7 @@ type Value struct {
 }
 
 func (v *Value) Load() any
-func (v *Value) Store(x any) // Go 1.17+ 放宽了类型一致性约束
+func (v *Value) Store(x any) // 所有 Store 必须使用相同具体类型，且不能为 nil
 ```
 
 **CAS 实现无锁计数**
@@ -752,7 +752,7 @@ func AddInt32(addr *int32, delta int32) int32 {
    ```
 
 2. **CAS 循环要小心活锁**：高竞争下 CAS 反复失败，CPU 空转。竞争激烈时 Mutex 反而更优。
-3. **`atomic.Value` 的类型一致性（Go 1.17 前）**：第一次 Store 决定类型，后续 Store 必须同类型，否则 panic。Go 1.17+ 放宽：只要底层类型一致即可，但仍建议统一类型。
+3. **`atomic.Value` 的类型一致性**：第一次 Store 决定具体类型，后续 Store 必须是完全相同的具体类型，否则 panic；存 nil 也会 panic。该约束没有因 Go 1.17 放宽。
 4. **atomic 不替代所有锁**：它适合"单变量"原子操作。多变量一致性仍需 Mutex（或用 `atomic.Pointer` 整体替换不可变结构）。
 5. **`atomic.Pointer[T]`（Go 1.19+）做无锁配置热更新**：
 
@@ -798,9 +798,9 @@ func AddInt32(addr *int32, delta int32) int32 {
 
 - **Mutex**：int32 状态位编码锁/唤醒/饥饿/等待者计数；正常模式自旋抢锁、饥饿模式直接交接队首，1ms 阈值切换；不可重入、禁复制。
 - **RWMutex**：`readerCount` 双用途计数器实现写者优先；读锁并发、写锁独占；不可升级、不可递归。
-- **Once**：双重检查 + atomic done；f panic 不标记完成；Go 1.21+ 用 `atomic.Uint32` 与 `OnceFunc/OnceValue`。
+- **Once**：双重检查 + atomic done；f panic 时仍标记完成；Go 1.21+ 的 `OnceFunc/OnceValue` 会对后续调用重放 panic。
 - **Cond**：notifyList 的 ticket 机制防止丢失唤醒；`Wait` 必须 for 循环检查条件；禁复制；优先用 channel。
-- **WaitGroup**：64 位打包 counter(高32) + waiter(低32) 原子更新；Add 必须在 goroutine 外；Go 1.20+ 有 `wg.Go`。
+- **WaitGroup**：状态字打包 counter 与 waiter；传统模式的 Add 必须在 goroutine 外，Go 1.25+ 可用 `wg.Go`。
 - **Pool**：每 P 本地池 + victim 两代缓存，GC 时部分清理；只适合短生命周期可重建对象，Put 前 Reset；不是持久缓存。
 - **Atomic**：CPU 原子指令 + 内存屏障；`atomic.Int64` 等保证对齐；`atomic.Pointer[T]` 适合配置热更新；高竞争下 CAS 循环可能不如 Mutex。
 

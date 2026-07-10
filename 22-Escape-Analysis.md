@@ -202,14 +202,14 @@ for i := 0; i < 64; i++ { s = append(s, i) }
 // 1.18 前：max(any, any) 装箱
 func maxAny(a, b any) any { ... }
 
-// 1.18+：泛型零装箱
+// 1.18+：泛型保留静态类型，不需要业务代码做 any 断言
 func maxT[T constraints.Ordered](a, b T) T {
     if a > b { return a }
     return b
 }
 ```
 
-泛型在编译期特化，类型参数是具体类型，不经过 interface 装箱。这是泛型对性能的隐性贡献。
+泛型可以避免显式转换到 `any`，但 Go 规范不承诺完全特化或零分配。当前编译器可能共享相同 GC shape 的机器码并通过 dictionary 传递类型操作；约束方法、接口转换和逃逸仍可能有成本。使用 `-gcflags=-m=2` 和 benchmark 验证具体调用点。
 
 **技巧 4：`sync.Pool` 复用堆对象**
 

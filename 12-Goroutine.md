@@ -107,7 +107,7 @@ func schedule() {
 
 #### 3. 工程实践与常见坑
 
-- **`GOMAXPROCS` 的含义是 P 的数量，不是线程数，也不是 CPU 数。** 默认等于 `runtime.NumCPU()`，可通过 `runtime.GOMAXPROCS(n)` 或环境变量 `GOMAXPROCS` 设置。在容器化场景下，默认值会取宿主机 CPU 数，导致 P 过多引发上下文切换抖动，建议在容器入口显式调用 `runtime.GOMAXPROCS(runtime.NumCPU())` 或使用 `automaxprocs` 库读取 cgroup 限制。
+- **`GOMAXPROCS` 的含义是 P 的数量，不是线程数。** Go 1.25 起，在 Linux 且模块语言版本至少为 1.25 时，默认值会综合逻辑 CPU 数、CPU affinity 和 cgroup CPU quota，并可随配额变化定期更新。环境变量 `GOMAXPROCS` 或调用 `runtime.GOMAXPROCS` 会覆盖并停止自动更新；`runtime.SetDefaultGOMAXPROCS` 可恢复默认策略。旧工具链或关闭相关 `GODEBUG` 时才需要 `automaxprocs` 一类兼容方案，不要无条件调用 `GOMAXPROCS(runtime.NumCPU())` 覆盖容器感知结果。
 - **`debug.SetMaxThreads(N)` 设置 M 上限。** 默认 10000，对绝大多数应用足够；但若你的程序大量使用阻塞 syscall（如 cgo 调用阻塞库），M 会随 P 解绑而暴涨，可能撞顶，撞顶后新建 goroutine 会 panic `go: runtime: out of threads`。
 - **不要在 `init` 里 `go func`。** init 期间 scheduler 可能尚未完全就绪，goroutine 启动时机不确定，容易产生"测试偶现 nil"的问题。
 - **goroutine 不是协程。** 用户态协程通常需要显式 `yield`，而 goroutine 由调度器抢占式调度（Go 1.14+），不要假设"同步点"。
@@ -195,7 +195,7 @@ mexit()          // M 退出（罕见，仅在 maxmcount 收缩时）
 
 - **M 数量可以远大于 P 数量**：当大量 goroutine 阻塞在 syscall（尤其是 cgo 调用）时，M 会持续被创建，每个阻塞的 M 占一份内核资源（默认栈 8MB）。1000 个阻塞 syscall 理论上吃 8GB 内存——这就是 `maxmcount` 存在的原因。
 - **cgo 是 M 杀手**：cgo 调用进入 C 代码时，Go 调度器无法抢占该 M，P 会被 handoff 出去，M 阻塞在 C 里。高频 cgo + 大量 goroutine 会触发 M 暴涨，监控上表现为 `go_sched_goroutines` 与线程数同时飙升。
-- **`runtime.NumGOMAXPROCS() != runtime.NumCPU()` 的容器陷阱**：见 Scheduler 节，此处不重复，但根因是 P 数与 M 数脱钩后，M 行为受 cgroup 影响。
+- **`GOMAXPROCS` 可以小于 `runtime.NumCPU()`**：现代 Runtime 会考虑 affinity 与 cgroup quota；前者是当前并行度，后者仍是启动时可见的逻辑 CPU 数。监控应使用 `/sched/gomaxprocs:threads` 或 `runtime.GOMAXPROCS(0)` 观察实际值。
 - **调试 M 状态**：`runtime/pprof` 的 threadcreate profile 可以看线程创建；`/debug/pprof/threadcreate?debug=1` 输出每个 M 的栈。线上偶现"线程数暴涨"时是第一手段。
 
 ---
