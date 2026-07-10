@@ -1,6 +1,6 @@
-## 第10章 Goroutine（重点）
+## 第12章 Goroutine（重点）
 
-> 引言：Goroutine 是 Go 语言并发模型的灵魂。它以极低的创建与切换成本支撑了"百万并发"的工程神话，而这一神话的底层支柱是 Go Runtime 的 GMP 调度器。本章将从调度器整体设计出发，逐个拆解 M、P、G 三大核心实体，串起 GMP 协同模型，再深入 work stealing、抢占调度、syscall、netpoll 这些让 goroutine "跑得稳、跑得快、跑得不被饿死"的关键机制。理解本章，是理解 [第11章 Channel](./11-Channel.md) 与 [第12章 select](./12-select.md) 的前置基础。
+> 引言：Goroutine 是 Go 语言并发模型的灵魂。它以极低的创建与切换成本支撑了"百万并发"的工程神话，而这一神话的底层支柱是 Go Runtime 的 GMP 调度器。本章将从调度器整体设计出发，逐个拆解 M、P、G 三大核心实体，串起 GMP 协同模型，再深入 work stealing、抢占调度、syscall、netpoll 这些让 goroutine "跑得稳、跑得快、跑得不被饿死"的关键机制。理解本章，是理解 [第13章 Channel](./13-Channel.md) 与 [第14章 select](./14-select.md) 的前置基础。
 
 ---
 
@@ -999,4 +999,4 @@ netpoll 与调度器的协作要点：
 - 诊断 M 暴涨、goroutine 泄漏、STW 过长、netpoll 失效等典型问题；
 - 合理设置 `GOMAXPROCS`、`maxmcount`、`GOGC`、`netdns=go` 等运行时参数。
 
-下一章 [第11章 Channel](./11-Channel.md) 将进入 goroutine 间通信的世界——channel 的底层 hchan 结构、send/recv 状态机、与调度器的 `gopark`/`goready` 联动，是本章调度机制的直接应用。
+下一章 [第13章 Channel](./13-Channel.md) 将进入 goroutine 间通信的世界——channel 的底层 hchan 结构、send/recv 状态机、与调度器的 `gopark`/`goready` 联动，是本章调度机制的直接应用。

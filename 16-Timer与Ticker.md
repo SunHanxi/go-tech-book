@@ -1,4 +1,4 @@
-## 第14章 Timer 与 Ticker
+## 第16章 Timer 与 Ticker
 
 > 引言：`time` 包里的 Timer 与 Ticker 是 Go 里"延时"与"周期触发"的两大原语。它们看似简单（一个 channel + 一个触发时间），底层却共享 Runtime 的**四叉最小堆**定时器系统，并与 netpoller、调度器深度耦合。用不好——`time.After` 不消费会泄漏、`Reset` 时机不对会丢信号、`Stop` 不关 channel 令人困惑。本章沿着 Timer / After / AfterFunc / Ticker / Stop / Reset / Runtime Timer 一路讲到底层实现。
 

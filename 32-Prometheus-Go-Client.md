@@ -1,4 +1,4 @@
-## 第26章 Prometheus Go Client
+## 第32章 Prometheus Go Client
 
 > Prometheus 的 Pull 模型要求被监控进程通过 `/metrics` 暴露指标。`client_golang`（`github.com/prometheus/client_golang/prometheus`）是 Go 侧的标准实现，核心抽象是 Collector → Registry → Gather → Exposition。理解这条链路，就能写出高效、无锁竞争的自定义指标。
 

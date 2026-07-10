@@ -1,4 +1,4 @@
-## 第24章 Controller
+## 第30章 Controller
 
 > Informer 解决了"如何拿到资源"的问题，Controller 解决了"如何让资源状态收敛到期望"的问题。本章围绕 controller-runtime 的 Reconcile 模式，剖析 WorkQueue、RateLimiter、Retry、Context 的源码要点，把"声明式 + 水平触发 + 幂等重试"的控制器内核讲透。
 
@@ -813,7 +813,7 @@ func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 
 - **ctx 与 leader election**：非 leader 副本的 Controller 不会启动 worker，但 informer 还在跑。Manager 切换 leader 时会 Stop 旧 Controller、Start 新 Controller，ctx 在这个过程中被 cancel 再重建。Reconcile 里不要假设 ctx 是"永生"的。
 
-- **tracing/metrics 通过 ctx 传递**：不要在 Reconcile 里 `context.Background()` 新建 ctx，会丢掉 span，tracing 链路断掉。更多 context 的细节可参考 [第13章 Context](./13-Context.md)。
+- **tracing/metrics 通过 ctx 传递**：不要在 Reconcile 里 `context.Background()` 新建 ctx，会丢掉 span，tracing 链路断掉。更多 context 的细节可参考 [第15章 Context](./15-Context.md)。
 
 - **Webhook 也要用 ctx**：`webhook.AdmissionHandler` 同样接收 ctx，处理超时由 webhook server 控制（默认 10s）。Webhook 里不要做重活，否则拖慢 apiserver 准入。
 
@@ -828,4 +828,4 @@ func (r *MyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Re
 - Context 贯穿 Manager → Controller → Reconcile，承载取消、超时、tracing；Reconcile 必须响应 ctx.Done()，优雅停机依赖 Queue.ShutDown 让 worker 退出。
 - 控制器的三大原则：**水平触发不依赖事件、幂等可重入、失败交 workqueue 退避重试而非自己循环**。
 
-读完本章，你应该能读懂 controller-runtime 的核心循环，并能写出生产级的 Reconciler。结合 [第23章 client-go](./23-client-go.md) 的 Informer 机制，Kubernetes 控制平面的"读-调-写"闭环就完整了。
+读完本章，你应该能读懂 controller-runtime 的核心循环，并能写出生产级的 Reconciler。结合 [第29章 client-go](./29-client-go.md) 的 Informer 机制，Kubernetes 控制平面的"读-调-写"闭环就完整了。

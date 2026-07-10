@@ -1,4 +1,4 @@
-## 第23章 client-go
+## 第29章 client-go
 
 > client-go 是 Kubernetes 生态的基石，Informer 机制则是 client-go 的灵魂。理解 Informer 的工作原理，是读懂 controller-runtime、Operator 模式乃至整个 Kubernetes 控制平面的前提。本章自顶向下拆解 Informer 的核心组件：Informer、Reflector、DeltaFIFO、Indexer、SharedInformer，给出关键结构体与伪代码，并讨论工程实践中的常见坑。
 
@@ -136,7 +136,7 @@ func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
 
 - **必须 WaitForCacheSync 后再读缓存**：Informer 启动是异步的，启动后立刻读 Indexer 可能读到空集合，导致误判"资源不存在"。控制器入口都要 `cache.WaitForCacheSync(stop, inf.HasSynced)`。
 
-- **事件处理要快**：`OnAdd/OnUpdate/OnDelete` 是在 `sharedProcessor` 的 goroutine 里同步执行的。如果回调里做了重活（HTTP、DB 写入），会阻塞整个 Informer 的事件分发。标准做法是回调只把 key 入队到 workqueue，真正的处理在 Reconcile 循环里做（见 [第24章 Controller](./24-Controller.md)）。
+- **事件处理要快**：`OnAdd/OnUpdate/OnDelete` 是在 `sharedProcessor` 的 goroutine 里同步执行的。如果回调里做了重活（HTTP、DB 写入），会阻塞整个 Informer 的事件分发。标准做法是回调只把 key 入队到 workqueue，真正的处理在 Reconcile 循环里做（见 [第30章 Controller](./30-Controller.md)）。
 
 - **同一个 GVR 不要建多个 Informer**：每个 Informer 都会与 API Server 建立一条 Watch 长连接。同一个资源类型请用 `SharedInformerFactory` 复用，否则 API Server 压力大、Watch 也更容易被限流。
 
@@ -685,4 +685,4 @@ func main() {
 - SharedInformer 让多业务方共享同一份缓存和 Reflector，配合 SharedInformerFactory 实现资源复用。
 - 工程实践的核心是：**用工厂复用、handler 入队不干活、WaitForCacheSync 后再读、Resync 不要太频繁、对象不可信要 deepcopy**。
 
-掌握 Informer 后，下一章我们将进入 [第24章 Controller](./24-Controller.md)，看 controller-runtime 如何在 Informer 之上构建 Reconcile 控制循环。
+掌握 Informer 后，下一章我们将进入 [第30章 Controller](./30-Controller.md)，看 controller-runtime 如何在 Informer 之上构建 Reconcile 控制循环。

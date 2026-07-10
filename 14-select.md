@@ -1,6 +1,6 @@
-## 第12章 select（重点）
+## 第14章 select（重点）
 
-> 引言：如果说 [channel](./11-Channel.md) 是 goroutine 之间的"管道"，那么 `select` 就是把这些管道汇到一起的"交换机"。它能同时监听多个 channel 的收发，并在其中任意一个就绪时作出响应——这是 Go 实现超时、取消、多路复用、动态分支的核心武器。本章从语法语义一路下探到运行时 `selectgo` 的源码实现，讲清随机选择与公平性的来龙去脉。
+> 引言：如果说 [channel](./13-Channel.md) 是 goroutine 之间的"管道"，那么 `select` 就是把这些管道汇到一起的"交换机"。它能同时监听多个 channel 的收发，并在其中任意一个就绪时作出响应——这是 Go 实现超时、取消、多路复用、动态分支的核心武器。本章从语法语义一路下探到运行时 `selectgo` 的源码实现，讲清随机选择与公平性的来龙去脉。
 
 ---
 
@@ -718,4 +718,4 @@ func main() {
 - **只能操作 channel**：源自 CSP 模型的纯粹性、类型安全、同步语义确定性；定时器/信号/取消等事件都被"channel 化"以纳入 select。
 - **`selectgo` 实现**：scase 数组 → 洗牌 → 非阻塞探测 → (default 或挂起) → 唤醒清理，五阶段流程；按 channel 地址排序加锁避免死锁；`isSelect` 标记协调多 channel 唤醒。
 
-掌握 select 的关键在于理解它"事件驱动的非确定性多路复用"本质——它不是 `switch`，不是 `epoll`，而是 CSP 模型下对 channel 的天然补充。配合上一章的 [channel 原理](./11-Channel.md)，你已经具备了 Go 并发编程最核心的两块基石。后续章节将进入 context、sync 包与运行时调度的更深层。
+掌握 select 的关键在于理解它"事件驱动的非确定性多路复用"本质——它不是 `switch`，不是 `epoll`，而是 CSP 模型下对 channel 的天然补充。配合上一章的 [channel 原理](./13-Channel.md)，你已经具备了 Go 并发编程最核心的两块基石。后续章节将进入 context、sync 包与运行时调度的更深层。

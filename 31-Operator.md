@@ -1,10 +1,10 @@
-## 第25章 Operator（重点）
+## 第31章 Operator（重点）
 
 > Operator = CRD + 控制循环。`controller-runtime` 把 Kubernetes 声明式 API 的“期望状态 → 实际状态”收敛逻辑封装成一套可复用的工程框架，让你专注于 Reconcile，而不用自己拼装 List/Watch/队列/Leader Election/Webhook 等基础设施。
 
 ### controller-runtime
 
-`controller-runtime` 是 kubebuilder / Operator SDK 背后的核心库。它在 [第23章 client-go](./23-client-go.md) 的 Informer 体系和 [第24章 Controller](./24-Controller.md) 的 WorkQueue + Reconcile 模式之上，提供更高层的抽象。
+`controller-runtime` 是 kubebuilder / Operator SDK 背后的核心库。它在 [第29章 client-go](./29-client-go.md) 的 Informer 体系和 [第30章 Controller](./30-Controller.md) 的 WorkQueue + Reconcile 模式之上，提供更高层的抽象。
 
 **为什么需要它**：用裸 client-go 写一个控制器要手动接线 Reflector → DeltaFIFO → Indexer → workqueue → Reconcile，还要自己处理 Leader Election、Metrics、Webhook、优雅退出。`controller-runtime` 把这些全部收口到 `Manager` 里，开发者只需实现 `Reconcile(request)` 一个方法。
 
@@ -93,7 +93,7 @@ mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 
 ### Cache
 
-`Cache` 是对 `SharedInformer`（见 [第23章 client-go](./23-client-go.md)）的封装。它在本地维护一份 Watch 到的对象副本，使 `Client.Get/List` 直接读内存（无 apiserver 往返），并通过 List+Watch 接收变更事件驱动 Reconcile。
+`Cache` 是对 `SharedInformer`（见 [第29章 client-go](./29-client-go.md)）的封装。它在本地维护一份 Watch 到的对象副本，使 `Client.Get/List` 直接读内存（无 apiserver 往返），并通过 List+Watch 接收变更事件驱动 Reconcile。
 
 **关键设计**：
 

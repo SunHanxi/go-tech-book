@@ -1,6 +1,6 @@
-## 第11章 Channel（重点）
+## 第13章 Channel（重点）
 
-> 引言：Channel 是 Go 并发模型的灵魂。它源自 Hoare 提出的 CSP（Communicating Sequential Processes）思想——"不要通过共享内存来通信，而要通过通信来共享内存"。本章从 `hchan` 的运行时结构出发，逐层剖析有缓冲/无缓冲 channel 的收发流程、`close` 与 `range` 的语义，并落到工程中的最佳实践与常见坑。读懂本章，是理解下一章 [select](./12-select.md) 的基础。
+> 引言：Channel 是 Go 并发模型的灵魂。它源自 Hoare 提出的 CSP（Communicating Sequential Processes）思想——"不要通过共享内存来通信，而要通过通信来共享内存"。本章从 `hchan` 的运行时结构出发，逐层剖析有缓冲/无缓冲 channel 的收发流程、`close` 与 `range` 的语义，并落到工程中的最佳实践与常见坑。读懂本章，是理解下一章 [select](./14-select.md) 的基础。
 
 ---
 
@@ -72,7 +72,7 @@ recv 路径:  chanrecv -> lock -> [buf 非空? 读 buf : sendq 有? 直接拿 : 
 1. **goroutine 泄漏**：向一个无人接收的**无缓冲** channel 发送，或向已满 channel 发送而无人接收，goroutine 永久阻塞。建议配合 `context` 或带超时的 `select`。
 2. **向已关闭 channel 发送** → panic: `send on closed channel`。关闭责任应交给**唯一的发送方**。
 3. **重复关闭** → panic: `close of closed channel`。可用 `sync.Once` 或方向受限 channel 规避。
-4. **nil channel 的妙用**：向 nil channel 收发会**永久阻塞**，在 `select` 中用 nil case 可"动态禁用"某个分支（见第 12 章）。
+4. **nil channel 的妙用**：向 nil channel 收发会**永久阻塞**，在 `select` 中用 nil case 可"动态禁用"某个分支（见第14章）。
 
 > 经验法则：channel 的所有者（创建者 / 唯一发送方）负责关闭；接收方永远不要关闭。这条规则能消除 90% 的 channel 关闭 panic。
 
@@ -535,7 +535,7 @@ go func() {
 // 取消时调用 cancel()，发送方自行退出，再由所有者关闭 ch
 ```
 
-**关闭 nil channel 的妙用**：在 `select` 中把一个 channel 变量置 `nil`，对应 case 会永久阻塞（即"禁用"该分支），常用于"处理完一类事件后不再处理"的状态机。详见第 12 章。
+**关闭 nil channel 的妙用**：在 `select` 中把一个 channel 变量置 `nil`，对应 case 会永久阻塞（即"禁用"该分支），常用于"处理完一类事件后不再处理"的状态机。详见第14章。
 
 ---
 
@@ -628,7 +628,7 @@ default:
 
 #### 2. 为什么这样设计
 
-`select` 是 CSP 模型中"非确定性选择"的实现，它让程序能**公平地**等待多个事件源，而不是轮询。底层由 `runtime.selectgo` 实现，涉及 `scase` 数组、对所有 channel 加锁、随机洗牌等机制——细节留到第 12 章详述。
+`select` 是 CSP 模型中"非确定性选择"的实现，它让程序能**公平地**等待多个事件源，而不是轮询。底层由 `runtime.selectgo` 实现，涉及 `scase` 数组、对所有 channel 加锁、随机洗牌等机制——细节留到第14章详述。
 
 这里只需理解一个高层流程：
 
@@ -661,7 +661,7 @@ default:
 - **动态禁用 case**：把 channel 变量置 `nil`，对应 case 永久阻塞，等价于"从 select 中移除"。
 - **空 select `select{}`**：永久阻塞，常用于让 main goroutine 等待信号（避免泄漏的 goroutine 退出前 main 退出）。
 
-> `select` 的完整原理（`scase` 结构、`selectgo` 算法、随机性与公平性）见 [第 12 章 select](./12-select.md)。
+> `select` 的完整原理（`scase` 结构、`selectgo` 算法、随机性与公平性）见 [第14章 select](./14-select.md)。
 
 ---
 
@@ -975,4 +975,4 @@ for i := 0; i < 5; i++ {
 - **`select`** 是多路 channel 复用，随机选择就绪分支，底层 `selectgo` 详见下一章。
 - **最佳实践**：方向受限表达所有权、发送方负责关闭、pipeline/fan-out/context 配合、避免把 channel 当锁或集合。
 
-掌握 channel 的关键在于理解它"传递数据 + 同步"二合一的本质，以及"所有者关闭、接收方只读"的所有权模型。下一章 [select](./12-select.md) 会深入 `scase` 与 `selectgo`，揭示随机性与公平性的运行时实现。
+掌握 channel 的关键在于理解它"传递数据 + 同步"二合一的本质，以及"所有者关闭、接收方只读"的所有权模型。下一章 [select](./14-select.md) 会深入 `scase` 与 `selectgo`，揭示随机性与公平性的运行时实现。

@@ -1,4 +1,4 @@
-## 第13章 Context（重点）
+## 第15章 Context（重点）
 
 > 引言：Context 是 Go 并发编程中跨 goroutine 传递"取消信号、超时、截止时间、请求级数据"的标准载体。它用一棵不可变的 Context 树，把一次请求产生的所有子任务组织起来，让任意一层都能优雅地"通知整棵树退出"。本章将沿着 `cancel / timeout / deadline / value` 四条主线，深入 `cancelCtx`、`timerCtx`、`valueCtx` 的源码实现，并给出工程实践中的避坑指南。
 
@@ -341,7 +341,7 @@ func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
 
 要点：
 1. **父 deadline 更早则退化为 cancelCtx**：避免重复 timer，遵循"最严格的截止时间生效"原则。
-2. **`time.AfterFunc`**：把取消动作注册到 Runtime 的 timer 堆（详见 [第14章 Runtime Timer](./14-Timer与Ticker.md#runtime-timer)）。到点 Runtime 在独立 goroutine 执行 `c.cancel(...)`。
+2. **`time.AfterFunc`**：把取消动作注册到 Runtime 的 timer 堆（详见 [第16章 Runtime Timer](./16-Timer与Ticker.md#runtime-timer)）。到点 Runtime 在独立 goroutine 执行 `c.cancel(...)`。
 3. **手动 cancel 时 Stop timer**：避免 timer 已派发但尚未执行造成的资源悬挂。
 
 **工程实践与常见坑**
