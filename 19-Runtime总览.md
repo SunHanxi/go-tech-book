@@ -1,476 +1,324 @@
 ## 第19章 Runtime 总览
 
-> 引言：Go 程序看似"原生可执行"，实际上每个二进制里都内嵌了一个庞大的运行时（runtime）。Runtime 负责 goroutine 调度、内存分配、垃圾回收、栈管理、网络 I/O 与系统调用拦截。本章是 Runtime 部分的"地图"，后续 [第20章 内存管理](./20-内存管理.md)、[第21章 GC](./21-GC.md)、[第12章 Goroutine](./12-Goroutine.md) 等都会基于本章的脉络展开。
+> 本章是 Runtime 部分的地图，内部实现快照基于 Go 1.26.4。后续[第20章 内存管理](./20-内存管理.md)、[第21章 GC](./21-GC.md) 与[第12章 Goroutine](./12-Goroutine.md) 分别展开子系统。Runtime 私有字段、常量和调度启发式不属于 Go 1 兼容性承诺，阅读源码时必须固定到具体 tag。
 
 ### Runtime 做什么
 
-**1. 是什么**
+Go runtime 通常与用户代码一起链接到可执行文件中，不是需要独立安装的 JVM 式虚拟机。cgo、plugin、`-buildmode=shared` 等构建方式可引入动态链接，因此“Go 永远是完全静态单文件”也不是语言保证。
 
-Go 的 runtime 是一段与用户代码静态链接在一起的库（不是 JVM 那样的独立虚拟机），它在程序启动时被自动初始化，并在程序整个生命周期里持续运行。它对外提供两类能力：
+Runtime 主要负责：
 
-- 对用户代码透明的"基础设施"：goroutine 调度、栈自动扩缩容、并发垃圾回收、内存分配、网络 poller、系统调用封装、信号处理、time/timer、map/slice/channel 等内置类型的部分实现。
-- 显式 API：`runtime`、`runtime/debug`、`runtime/metrics`、`runtime/pprof`、`runtime/trace` 包暴露的函数，例如 `runtime.Gosched()`、`runtime.GC()`、`runtime.LockOSThread()`。
+- goroutine 调度、抢占与栈扩缩；
+- 堆分配、垃圾回收与物理页归还；
+- network poller、timer、部分系统调用和信号处理；
+- channel、map、slice、interface 与 reflect 所需的底层支持；
+- race/asan/msan、pprof、trace、metrics 等运行时观测能力；
+- 调用用户 `init` 和 `main`，管理进程启动与结束。
 
-可以把它理解为一个"嵌入式的微内核"：用户写的 `func main()` 其实只是被 runtime 调用的一个普通 goroutine。
+编译器与 Runtime 是一套协同系统。编译器会根据代码生成或插入：
 
-**2. 为什么这样设计 / 实现要点**
+- `runtime.mallocgc` 等分配入口；
+- 函数序言中的栈边界/抢占检查；
+- 堆与全局指针写入的写屏障；
+- stack map、GC bitmap、类型元数据和安全点；
+- map、channel、interface 等操作的 Runtime/ABI 调用。
 
-与 C/C++、Java 相比，Go 选择把 runtime 编译进二进制的几个关键动机：
+这也是为什么某些实现变更必须同时修改 `cmd/compile`、`runtime` 和 `internal/abi`。
 
-| 设计选择 | 收益 | 代价 |
-| --- | --- | --- |
-| 静态链接 runtime | 部署只有一个文件，无依赖 | 二进制偏大（几 MB 起步） |
-| 内嵌调度器 | goroutine 可在用户态切换，开销 ~200ns | 不能轻易"绑核"做实时调度 |
-| 内嵌 GC | 内存安全，免手动 free | 有 STW 与后台 CPU 占用 |
-| 运行时管理栈 | 栈可按需扩缩，goroutine 起步 2KB | 需要 stack copy，对 CGO 不友好 |
-| 编译器 + runtime 协作 | 逃逸分析、写屏障、抢占点都由编译器插入 | 源码层面强耦合 `cmd/compile` 与 `runtime` |
+#### Go 1.26.4 源码地图
 
-runtime 的源码主要在 `src/runtime/` 下，关键文件大致分工如下：
+```text
+src/runtime/
+|-- runtime2.go           G/M/P 与全局 Runtime 核心类型
+|-- proc.go               启动、调度、sysmon、GOMAXPROCS
+|-- stack.go              goroutine 栈分配、复制和缩小
+|-- chan.go / select.go   channel 与 select
+|-- time.go               timer 与每 P timer heap
+|-- netpoll*.go           平台 network poller
+|-- malloc.go             mallocgc 与 tiny/small/large 分流
+|-- mcache.go             每 P 分配缓存
+|-- mcentral.go           每 span class 的共享 span 集合
+|-- mheap.go              mspan、mheap 与 arena 元数据
+|-- mpagealloc.go         page bitmap 与 radix summary 页分配器
+|-- mgc.go                GC 周期与阶段转换
+|-- mgcpacer.go           heap goal、trigger、assist、memory limit
+|-- mgcmark*.go           根扫描、标记与 Green Tea 路径
+|-- mgcwork.go            workbuf 和 span queue
+|-- mbarrier.go           混合写屏障说明与批量入口
+|-- mgcsweep.go           span 清扫
+`-- mgcscavenge.go        空闲物理页归还
 
+src/internal/runtime/gc/sizeclasses.go  当前 size class 表
+src/internal/runtime/maps/             Go 1.24+ Swiss Table map 主体
+src/cmd/compile/internal/escape/        逃逸分析
 ```
-runtime/
-├── runtime2.go        // G/M/P 核心结构体定义
-├── proc.go            // 调度器：schedule(), findRunnable(), sysmon
-├── mheap.go           // 全局堆 mheap
-├── mcache.go          // 每个 P 的本地缓存
-├── mcentral.go        // 每个 span class 的中央缓存
-├── mspan.go           // span 结构与操作
-├── malloc.go          // mallocgc 入口
-├── gc.go / gcwork.go  // GC 状态机
-├── mgc.go             // GC 阶段调度
-├── netpoll_*.go       // 网络 poller（epoll/kqueue/IOCP）
-├── time_*.go          // timer 实现
-├── stack.go           // 栈分配与复制
-├── signal_*.go        // 信号处理
-└── asm_amd64.s        // 汇编入口（rt0_go、switch、gogo）
-```
-
-> 关键认识：Go 编译器在生成机器码时，会在很多地方插入对 runtime 的调用——分配对象时插 `runtime.mallocgc`，函数序言插抢占检查 `runtime.morestack`，写指针插写屏障 `runtime.gcWriteBarrier`。没有编译器配合，runtime 没法独立完成这些事。
-
-**3. 工程实践与常见坑**
-
-观察 runtime 行为是排查性能问题的第一步：
-
-```go
-package main
-
-import (
-	"fmt"
-	"runtime"
-	"runtime/debug"
-)
-
-func main() {
-	// 设置 GOMAXPROCS，默认等于逻辑 CPU 数
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	// 主动触发 GC，常用于基准测试
-	runtime.GC()
-
-	// 打印内存分配统计
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	fmt.Printf("Alloc=%v MiB, NumGC=%d, PauseNs(total)=%v\n",
-		m.Alloc/1024/1024, m.NumGC, m.PauseTotalNs)
-
-	// 设置软内存上限（Go 1.19+），常用于容器
-	debug.SetMemoryLimit(1 << 30) // 1 GiB
-}
-```
-
-常见坑：
-
-- **`runtime.GOMAXPROCS(1)` 不等于串行**：网络 I/O 与系统调用会让出的 P 仍可被其他 M 拿走跑别的 goroutine。在容器中 `GOMAXPROCS` 默认等于逻辑 CPU 数，但 cgroup 限制并不影响这个值——Go 1.21 仍未自动适配 cgroup，需用 `go.uber.org/automaxprocs` 这类库。
-- **`runtime.LockOSThread` 与 goroutine 不对等**：调用后该 goroutine 永远绑在当前 OS 线程上，但 OS 线程在 goroutine 结束前不能复用。忘记 Unlock 会造成线程泄漏。
-- **`runtime.Caller` / `runtime.Stack` 有开销**：在高频路径里抓栈会显著拖慢，性能敏感处应使用 `runtime.Callers` 直接拿 PC 数组。
-- **`GODEBUG` 调试**：`GODEBUG=schedtrace=1000,scheddetail=1` 可每秒打印调度器状态；`gctrace=1` 打印每次 GC 概要。生产排查必备。
-
----
 
 ### 启动流程
 
-**1. 是什么**
+不同 OS/架构的汇编入口名称不同，但主线类似：
 
-执行 `./mybin` 到 `func main()` 真正运行之间，runtime 要完成大量初始化：建立 TLS、解析命令行参数、初始化调度器、分配栈、启动 sysmon 与 GC、把用户入口包装成 goroutine 并运行。理解启动流程有助于解释一些"反直觉"现象：为什么 `init()` 在 `main()` 之前？为什么 `runtime.main` 不是用户写的 `main`？
-
-**2. 底层实现要点**
-
-以 Linux/amd64 为例（不同平台文件名不同，流程一致）：
-
-1. **入口**：ELF 入口指向 `runtime.rt0_linux_amd64`（汇编），它设置 SP 后跳到 `_rt0_amd64_linux` → `runtime.rt0_go`。
-2. **`runtime.rt0_go`**（`asm_amd64.s`）：负责读取 argc/argv/envp，建立 TLS（`m0` 的 `tls` 字段），调用 `runtime.settls`、`runtime.osinit`、`runtime.schedinit`，最后 `mstart` 跑起 `m0`。
-3. **`runtime.schedinit`**（`proc.go`）：
-   - 解析 `GODEBUG`、`GOMAXPROCS`、`GOGC`、`GOMEMLIMIT` 等环境变量。
-   - 初始化全局 `sched` 结构（`schedt`）。
-   - 创建 `allp` 数组，给每个 P 分配 `mcache`。
-   - 初始化 mheap、defer 池、type allocator、写屏障。
-4. **创建主 goroutine**：`runtime.rt0_go` 调 `runtime.mainPC = runtime.main`，并用 `runtime.newproc` 创建第一个 goroutine。
-5. **`runtime.mstart0`** → `mstart1` → `schedule()`：调度器从 `m0` 上启动，找到可运行的 G（就是刚创建的主 goroutine），`gogo` 切到它。
-6. **`runtime.main`**（`proc.go`）：在主 goroutine 上运行，依次做：
-   - `runtime.main_init_done` 信号量初始化；
-   - 启动 `sysmon` 后台线程（不是普通 M，是独立的 OS 线程）；
-   - 启动 `forcegc` goroutine；
-   - 调用 `runtime_init`（编译器生成的函数，包级 `init()` 全部跑在这里）；
-   - `main_init_done` 释放信号；
-   - 调用 `main_main`（用户 `main`，由 `//go:linkname` 链接到）；
-   - 退出整个进程。
-
-简化伪代码：
-
-```go
-package main
-
-//go:linkname main_main main.main
-func main_main()
-
-func main() {
-	g := getg()
-
-	// 设置主 goroutine 标识
-	g.m.g0.m = g.m
-
-	// 启动 sysmon（独立 OS 线程，不受 P 数量限制）
-	systemstack(func() {
-		newm(sysmon, nil, -1)
-	})
-
-	// 确保 m0 被绑定
-	lockOSThread()
-
-	// 包级 init()：用户包 init 顺序由依赖图决定
-	fn := main_init
-	fn()
-
-	close(main_init_done)
-
-	// 用户 main
-	if IsLibrary || IsArchive {
-		return
-	}
-	fn = main_main
-	fn()
-
-	// 退出
-	exit(0)
-}
+```text
+OS loader
+  -> 平台 rt0_* 汇编入口
+  -> runtime.rt0_go
+  -> osinit / schedinit
+  -> 创建 runtime.main goroutine
+  -> mstart / schedule
+  -> runtime.main
+  -> 包初始化
+  -> main.main
+  -> exit hooks / process exit
 ```
 
-> 注意：`runtime.main` 末尾不会 return，而是直接 `exit(0)`。这就是为什么 `main` 函数即使没显式 `os.Exit` 也不会"返回到调用者"——调用者是 runtime，进程直接被终结。
+`schedinit` 的具体顺序是私有实现，但概念上需要先完成：
 
-**3. 工程实践与常见坑**
+- m0/g0、TLS 与平台运行环境；
+- 命令行、环境变量和 `GODEBUG`；
+- 堆、GC controller、调度器全局状态；
+- P 列表与每 P `mcache`；
+- 随机源、安全、trace 等基础子系统。
 
-- **`init()` 的执行顺序**：依赖图决定，同包内按文件名升序、文件内按声明顺序。跨包：被导入的包先 `init`。可以利用这点做"插件式注册"，但不要在 `init` 里做重活（网络、磁盘 I/O）——它阻塞整个启动。
-- **`sync.Once` vs `init`**：能用 `init` 就别用 `Once`，`init` 对编译器和 CPU 友好（无原子开销）。
-- **`//go:linkname` 的使用**：访问 runtime 私有函数需要它，但属于"使用未导出 API"，Go 团队不保证兼容，升级版本可能失效。比如 `runtime.nanotime` 等已被移到 `runtime/sys_*`。
-- **冷启动延迟排查**：用 `runtime/trace` 看启动期各 `init()` 耗时；`pprof` 的 CPU profile 也可以从启动开始抓。
-- **`GODEBUG=inittrace=1`**（Go 1.20+）会打印每个包 `init` 的耗时与分配，是定位启动慢的利器。
+`runtime.main` 在主 goroutine 上启动必要的后台 Runtime 任务，执行 Runtime 和用户包初始化，然后调用用户 `main.main`。`main.main` 返回不会等待其他 goroutine 自行结束；需要优雅停机的服务必须在 `main` 返回前完成取消、排水与资源关闭。`os.Exit` 则不会运行当前 goroutine 的 defer。
 
----
+#### 包初始化顺序
+
+可依赖的原则是：
+
+1. 包按导入依赖顺序初始化，被导入包先完成。
+2. 一个包内先初始化包级变量，再按声明顺序调用 `init` 函数。
+3. 包初始化在单个 goroutine 中串行进行；`init` 启动的 goroutine 可以并发运行，但不会被初始化机制等待。
+
+语言规范不保证“同包多文件一定按文件名”。构建系统被鼓励按词法文件名顺序向编译器提交文件，但业务正确性不应依赖这一点。跨文件有顺序需求时，用显式函数和数据依赖表达。
+
+启动诊断可用：
+
+```bash
+GODEBUG=inittrace=1 ./service
+```
+
+`inittrace` 会报告包初始化的时间与分配。避免在 `init` 中做网络 I/O、无上限重试或依赖外部服务的工作，这些失败更适合由可返回 `error` 的显式初始化函数处理。
 
 ### Scheduler
 
-**1. 是什么**
+#### G-M-P 模型
 
-Go 调度器负责把 goroutine（G）映射到 OS 线程（M）上执行，并在线程因系统调用阻塞时把 M 与 P 解绑、让别的 M 接手 P 继续跑其他 G。其核心是 **G-M-P 模型**：
+- **G**（goroutine）：栈、寄存器上下文、状态、等待原因和调度元数据。
+- **M**（machine）：OS 线程及其 Runtime 状态，包含用于执行 Runtime 代码的 g0。
+- **P**（processor）：执行普通 Go 代码所需的逻辑资源，持有本地 run queue、runnext、`mcache`、timer 与 GC work。
 
-- **G**（goroutine）：用户级协程，包含栈、状态机、调度信息。
-- **M**（machine）：OS 线程，由 runtime 创建/回收，真正执行 G 的载体。
-- **P**（processor）：逻辑处理器，持有一组可运行 G 的本地队列和本地 mcache。`GOMAXPROCS` 决定 P 的数量。M 必须绑定一个 P 才能执行 G。
+M 通常要持有 P 才能执行用户 Go 代码。M 进入可阻塞系统调用时可与 P 分离，其他 M 接手 P，避免一个 OS 阻塞让所有 goroutine 停顿。
 
-调度器策略：本地队列优先、全局队列兜底、work stealing、网络 poller、sysmon 抢占。
-
-**2. 底层实现要点**
-
-G/M/P 在 `runtime2.go` 中定义（Go 1.21+，简化后保留关键字段）：
+Go 1.26.4 的概念布局：
 
 ```go
-package runtime
-
+// 只表示关系，不是可依赖结构定义
 type g struct {
-	stack       stack       // 当前栈的 [lo, hi)
-	stackguard0 uintptr     // 栈溢出检查哨兵；序言里比较 SP 与之
-	m           *m          // 当前绑定的 M
-	sched       gobuf       // 上下文：PC、SP、g 自己
-	atomicstatus uint32     // _Gidle/_Grunnable/_Grunning/_Gsyscall/_Gwaiting...
-	goid        int64       // goroutine id
-	waitsince   int64       // 阻塞起始时间（用于 trace)
-	lockedm     muintptr    // LockOSThread 后绑定的 M
-	preemptrun  uint8       // 异步抢占请求
-	// ...
+    stack       stack
+    stackguard0 uintptr
+    m           *m
+    sched       gobuf
+    atomicstatus uint32
+    waitreason  waitReason
+    lockedm     muintptr
 }
 
 type m struct {
-	g0          *g          // 调度栈专用 g，runtime 代码运行在它上面
-	curg        *g          // 当前在跑的用户 g
-	p           puintptr    // 绑定的 P
-	nextp       puintptr    // 解绑时下一个 P
-	oldp        puintptr    // 系统调用前的 P
-	mstartfn    func()      // m 启动函数（如 sysmon）
-	spinning    bool        // 正在自旋找活
-	lockedg     *g          // LockOSThread 反向引用
-	tls         [6]uintptr  // thread-local storage
-	// ...
+    g0       *g
+    curg     *g
+    p        puintptr
+    oldp     puintptr
+    spinning bool
+    lockedg  guintptr
 }
 
 type p struct {
-	id          int32
-	status      uint32      // _Pidle/_Prunning/_Psyscall/_Pgcstop/_Pdead
-	m           muintptr    // 绑定的 M
-	runqhead    uint32      // 本地队列头
-	runqtail    uint32      // 本地队列尾
-	runq        [256]guintptr // 本地队列：固定 256 槽，环形
-	runnext     guintptr    // 高优先级槽，下次直接跑
-	gFree struct {          // 死亡 g 的复用池
-		gList
-		n int32
-	}
-	mcache      *mcache     // 本地内存缓存（详见第20章）
-	timers      []*timer    // 本地 timer 堆（Go 1.14+ 每 P 一个）
-	gcBgMarkWorker guintptr // 后台标记 worker
-	gcw         gcWork      // GC 工作缓冲
-	// ...
-}
-
-type schedt struct {
-	gFree struct {          // 全局空闲 g 池
-		lock    mutex
-		stack   gList
-		noStack gList
-		n       int32
-	}
-	midle  muintptr         // 空闲 M 链表
-	nmidle int32
-	mnext  int64            // 下一个 M 的 id
-	pidle  puintptr         // 空闲 P 链表
-	npidle int32
-	runq     gQueue         // 全局可运行 G 队列
-	runqsize int32
-	// ...
+    id       int32
+    status   uint32
+    m        muintptr
+    runqhead uint32
+    runqtail uint32
+    runq     [256]guintptr
+    runnext  guintptr
+    mcache   *mcache
+    timers   timers
+    gcw      gcWork
 }
 ```
 
-调度主循环 `schedule()`（`proc.go`，简化伪代码）：
+`GOMAXPROCS` 决定 P 的数量，即同时执行普通 Go 代码的并行上限。它不限制进程的 OS 线程总数，也不保证 goroutine 不交错执行。
+
+#### 可运行 G 从哪里来
+
+`schedule`/`findRunnable` 的完整顺序很长，且会随调度器演进。需要掌握的来源是：
+
+- 当前 P 的 `runnext` 和本地环形 run queue；
+- 全局 run queue，当前实现会周期性检查以避免饥饿；
+- 从其他 P 偷取的一批 G 和 timer；
+- network poller 返回的就绪 G；
+- GC mark worker、trace reader 等 Runtime 工作；
+- 由 channel、mutex、semaphore、timer 或系统调用唤醒的 G。
+
+`runnext` 是优先槽，适合刚唤醒且与当前 G 有局部性的工作。Runtime 会限制继承时间片的连续使用，避免其他 G 永久饥饿。
+
+#### 抢占和 sysmon
+
+Go 同时使用：
+
+- 函数序言与安全点上的协作式抢占；
+- Go 1.14+ 在支持平台上的基于信号的异步抢占；
+- sysmon 对长时间运行 G、系统调用 P、timer、netpoll 和强制 GC 等状态的监控。
+
+早期 Go 版本中，不调用函数的紧循环可长时间不让出。现代 Go 的异步抢占显著改善了这个问题，但不能把某个私有时间阈值理解为实时调度 SLA。cgo、信号处理和 Runtime 内部不可抢占区域也需要单独理解。
+
+### 容器感知 `GOMAXPROCS`
+
+Go 1.25 起，当模块语言版本和 `GODEBUG` 允许新默认值且没有显式设置 `GOMAXPROCS` 时，Runtime 会综合：
+
+- 机器逻辑 CPU 数；
+- 进程 CPU affinity mask；
+- Linux cgroup CPU quota/period 表示的平均 CPU 吞吐上限。
+
+当前通常取三者最小值，cgroup 非整数 quota 向上取整。除非逻辑 CPU 或 affinity 本身小于 2，Runtime 不会因 cgroup quota 把默认值压到 2 以下。默认值可根据 affinity/cgroup 变化自动更新，最快约每秒一次。
+
+以下操作会禁用默认自动更新：
+
+- 把 `GOMAXPROCS` 环境变量设为正整数；
+- 调用 `runtime.GOMAXPROCS(n)` 设置自定义值。
+
+Go 1.25 新增的 `runtime.SetDefaultGOMAXPROCS()` 可按当前 CPU/affinity/cgroup 立即恢复并重算默认值。`GODEBUG=containermaxprocs=0` 与 `updatemaxprocs=0` 可禁用相应行为；对 `go 1.24` 及更早语言版本，这两个兼容开关默认为 0。
+
+工程建议：
+
+- 新的 Go 1.25+ 服务先使用 Runtime 默认值，不再无条件设置 `runtime.GOMAXPROCS(runtime.NumCPU())`，否则会覆盖容器感知值并禁用自动更新。
+- CPU 密集服务不要套用“核数乘 1.25”之类通用比例。P 过多可增加调度、GC 并行度和 cache 竞争，必须用实际 quota 下的负载测试决定。
+- 调用 `runtime.GOMAXPROCS(0)` 可读当前值，`/sched/gomaxprocs:threads` 可用于观测。
+
+### Network Poller 与阻塞系统调用
+
+支持 poll 的网络描述符通常设为非阻塞，goroutine 等待 I/O 时挂到 poll descriptor，不需要一个 OS 线程始终阻塞在每个连接上。epoll/kqueue/IOCP 等返回就绪事件后，Runtime 把相应 G 变为 runnable，它仍需要获得 P 才能继续执行。
+
+不能由 poller 处理的阻塞系统调用通常让 M 进入 syscall 状态并释放 P，调度器可创建或唤醒其他 M 继续使用该 P。Go Runtime 没有一条“所有文件 I/O 都进入固定线程池”的通用规则，具体路径取决于 OS、文件类型和标准库实现。
+
+观测时将以下信号结合：
+
+- `go tool trace` 的 goroutine state 和 network/syscall blocking；
+- goroutine profile 中的等待栈；
+- `GODEBUG=schedtrace=1000,scheddetail=1`；
+- `/sched/goroutines:goroutines`、`/sched/latencies:seconds` 和 Go 1.26 的分状态 goroutine 指标。
+
+Go 1.26 还提供实验性 `goroutineleak` profile，构建时需 `GOEXPERIMENT=goroutineleakprofile`。它利用 GC 可达性找“阻塞在已无可达唤醒路径的同步对象上”的一类泄漏，但无法发现所有逻辑泄漏，也不应取代取消、超时与持续 goroutine 监控。
+
+### GC 总览
+
+Go 1.26 的 GC 是非分代、非移动、并发标记-清扫回收器。Green Tea GC 已默认启用，它在传统对象 workbuf 之外按 span 组织小对象标记与扫描工作，改善局部性和 CPU 扩展性。`GOEXPERIMENT=nogreenteagc` 是 Go 1.26 用于回归定位的临时 opt-out，不是当前默认状态。
+
+一轮周期的主干：
+
+| 阶段 | 全局 STW | 主要工作 |
+|---|---|---|
+| Sweep termination + mark setup | 是 | 结束上轮清扫，启用写屏障/assist，排队根工作 |
+| Concurrent mark | 否 | worker 与 assist 扫描根和堆对象 |
+| Mark termination | 是 | 结束标记，刷新本地状态，更新 pacer |
+| Concurrent sweep | 否 | 回收 span slot，与后续分配并发 |
+
+根扫描 job 在 concurrent mark 期间执行；扫描某个 goroutine 栈时会暂停该 goroutine，不是把所有栈都塞进起始 STW。
+
+混合写屏障的概念模型：
 
 ```go
-package main
-
-func schedule() {
-top:
-	mp := getg().m
-	pp := mp.p.ptr()
-
-	var gp *g
-	// 1) 每 61 次调度看一眼全局队列，避免饥饿
-	if pp.schedtick%61 == 0 && sched.runqsize > 0 {
-		gp = globrunqget(pp, 1)
-	}
-	// 2) 本地 runnext
-	if gp == nil {
-		gp, _ = runqget(pp)
-	}
-	// 3) findRunnable：阻塞找——本地/全局队列、netpoll、steal、GC、sysmon
-	if gp == nil {
-		gp = findRunnable()
-	}
-
-	execute(gp)
-	// execute 内部 gogo 切到 gp，gp 跑完 yield 再回到 schedule
-	goto top
+// 概念伪代码
+shade(*slot)
+if currentStackIsGrey() {
+    shade(newPointer)
 }
+*slot = newPointer
 ```
 
-`findRunnable` 是调度器最复杂的函数，按以下顺序找活（简化）：
+`GOGC` 控制 live heap 与根集之上的增长预算，`GOMEMLIMIT` 是 Runtime 管理内存的软限制。二者都不保证固定 pause，`GOMEMLIMIT` 也不约束 cgo、应用自行 mmap 等非 Runtime 管理内存。
 
-1. 本地队列、全局队列；
-2. 网络 poller（非阻塞模式）；
-3. **work stealing**：随机选一个 P，偷它本地队列的一半；
-4. 如果都空，去检查 GC 是否需要 worker；
-5. 还没有 → 释放 P、把自己挂到 `midle`、`notesleep` 等被唤醒。
+首选观测：
 
-**抢占机制**有两类：
-
-- **协作式（Go 1.13 及之前主要靠）**：函数序言里 `cmp SP, g.stackguard0`，若栈不够或被设为 `0xffffffffffff` 触发 `morestack` → 检查 `preempt` 标志 → 让出。**纯计算无函数调用的 goroutine 永不主动让出**，是早期经典坑。
-- **异步抢占（Go 1.14+）**：`sysmon` 检测到 G 运行超过 10ms，向该 M 发信号（`SIGURG`），信号处理里强制插入抢占点，安全修改 PC 跳到 `runtime.asyncPreempt`。前提是寄存器上下文可以安全保存（部分 CGO 调用中会跳过）。
-
-调度全景图：
-
-```
-              ┌────────────────────────────────────────────┐
-              │              sched (全局)                   │
-              │   runq (全局 G)  midle  pidle  gFree        │
-              └────────────────────────────────────────────┘
-                                ▲ steal / 兜底
-        ┌───────────────────────┼───────────────────────┐
-        │                       │                       │
-   ┌────┴────┐             ┌────┴────┐             ┌────┴────┐
-   │  P 0    │             │  P 1    │  ...        │  P n    │   GOMAXPROCS
-   │ runq[256│             │ runq[256│             │ runq[256│
-   │ mcache  │             │ mcache  │             │ mcache  │
-   │ timers  │             │ timers  │             │ timers  │
-   └────┬────┘             └────┬────┘             └────┬────┘
-        │ bind                   │ bind                   │ bind
-   ┌────┴────┐             ┌────┴────┐             ┌────┴────┐
-   │   M0    │             │   M1    │  ...        │   Mn    │   OS 线程
-   │ (OS T)  │             │ (OS T)  │             │ (OS T)  │
-   └────┬────┘             └────┬────┘             └────┬────┘
-        │ curg                  │ curg                  │ curg
-     ┌──┴──┐                 ┌──┴──┐                 ┌──┴──┐
-     │ G a │                 │ G c │                 │ G e │
-     └─────┘                 └─────┘                 └─────┘
+```text
+/gc/heap/live:bytes
+/gc/heap/goal:bytes
+/gc/scan/heap:bytes
+/cpu/classes/gc/mark/assist:cpu-seconds
+/cpu/classes/gc/total:cpu-seconds
+/sched/pauses/total/gc:seconds
 ```
 
-**3. 工程实践与常见坑**
+`GODEBUG=gctrace=1` 适合快速排查，`runtime/metrics` 适合稳定观测，alloc/heap profile 用于定位分配点和持有链。详见[第21章 GC](./21-GC.md)。
 
-- **`GOMAXPROCS` 调优**：CPU 密集型任务设为核数即可；如果是混合 I/O，可以略大（如 `*1.25`），但太多会让 P 之间互偷开销变大、cache 命中率下降。容器环境强烈推荐 `go.uber.org/automaxprocs`，否则 Go 1.21 仍会读到宿主机核数。
-- **goroutine 泄漏排查**：`runtime.NumGoroutine()` 在监控里埋点；`pprof goroutine` 抓全栈，`debug=2` 模式带 `goroutine state`，能一眼看出 `_Gwaiting` 在哪个 channel。
-- **`GODEBUG=schedtrace=1000`**：每秒输出形如 `SCHED 0ms: gomaxprocs=4 idleprocs=0 threads=8 spinningthreads=1 idlethreads=4 runqueue=0 [0 0 0 0]`。`[0 0 0 0]` 是各 P 本地队列长度，长时间不均衡或 spinningthreads 异常高说明负载不均。
-- **`runtime.GOMAXPROCS(1)` 不保证并发安全**：它只限制并发执行的 P，不限制 GC、sysmon、网络 poller。把 `GOMAXPROCS(1)` 当作"race detector 替身"是危险的。
-- **网络 I/O 不占 P**：epoll 就绪后 netpoller 把 G 重新放回 P 的本地队列，所以高并发 echo server 即使 `GOMAXPROCS=1` 也能扛数千连接。
-- **同步阻塞系统调用会让 M 让出 P**：如 `Read(file)`。这是 Go 推 `non-blocking + poller` 设计的根本原因，文件 I/O 无法走 netpoll（Linux 上仍用线程池）。
+### 内存分配总览
 
-更多细节见 [第12章 Goroutine](./12-Goroutine.md)。
+编译器先决定对象能否放在 goroutine 栈上。需要堆分配的对象进入 `mallocgc`：
 
----
+```text
+size == 0
+  -> 特殊零尺寸地址
 
-### GC
+size < 16 B 且 noscan
+  -> tiny allocator
 
-**1. 是什么**
+size <= 32 KiB
+  -> size class
+  -> P.mcache
+  -> mcentral（本地 span 用完时）
+  -> mheap/pageAlloc（需要新 span 时）
 
-Go 使用**并发三色标记-清除垃圾回收器**（concurrent tri-color mark-sweep）。它在 Go 1.5 后变为并发，1.8 后 STW 通常 < 1ms，1.14 引入页堆 allocator 的无锁路径，1.19 引入 `GOMEMLIMIT` 软限制，1.21 进一步优化大对象与扫描。其目标不是极限吞吐，而是**低尾延迟**。
-
-**2. 底层实现要点**
-
-三色抽象：
-
-- **白**：未访问，回收候选。
-- **灰**：已访问，但其指向的对象还没扫描完。
-- **黑**：自身与所有出边都扫描完，本回合安全。
-
-GC 状态机（`runtime/mgc.go` 的 `gcStart`/`gcMarkDone`/`gcSweep`）大致阶段：
-
-| 阶段 | 是否 STW | 做什么 |
-| --- | --- | --- |
-| Sweep Termination | 极短 STW | 关闭上轮 sweep，准备标记 |
-| Mark Setup | STW | 启动所有 P 的写屏障 |
-| Mark (并发) | 否 | 后台 worker 与用户代码并发，扫描从根出发的对象图 |
-| Mark Termination | STW（亚毫秒） | 清空工作缓冲、关写屏障、统计 |
-| Sweep (并发) | 否 | 把未标记的 mspan 还给 heap |
-
-**写屏障**：并发标记期间，用户代码可能修改指针破坏三色不变式（黑→白插边）。Go 用 **Yuasa-style 删除屏障 + Dijkstra 插入屏障** 的混合方案（Go 1.8 起，叫 **hybrid write barrier**）。简化伪代码：
-
-```go
-package main
-
-import "unsafe"
-
-//go:nosplit
-func gcWriteBarrierptr(slot *unsafe.Pointer, ptr unsafe.Pointer) {
-	shade(*slot) // 删除侧：被覆盖的旧值染灰（Yuasa）
-	shade(ptr)   // 插入侧：写入的新值染灰（Dijkstra）
-	*slot = ptr
-}
+size > 32 KiB
+  -> 专用大对象 span
+  -> mheap/pageAlloc
 ```
 
-这样即使栈不重扫（栈对象改写不进屏障），也能保证三色安全——大幅压低 Mark Termination 的 STW。
+Go 1.26.4 有 68 个 size-class 索引，其中 0 是保留值，1..67 覆盖 8 B 到 32 KiB。与 scan/noscan 位组合后共 136 个 span class。大对象使用 size class 0，不是“第 67 类”。
 
-GC 触发条件：
+`mheap.pages` 的当前页分配器由 page bitmap 和多级 radix summary 组成，用摘要快速定位连续空闲 page。历史文章里的 `mTreap`、`free/busy treap` 不是 Go 1.26 实现。
 
-1. **堆增长**：下次 GC 目标 = 上次存活堆 × `(1 + GOGC/100)`。`GOGC=100`（默认）即堆翻倍触发。设 `GOGC=off` 关闭。
-2. **时间触发**：`runtime.forcegc` goroutine 每 2 分钟强制一次。
-3. **手动**：`runtime.GC()`。
-4. **GOMEMLIMIT**（1.19+）：达到软上限即使没到 GOGC 目标也触发，类似 Java 的 soft limit。`GOMEMLIMIT=off` 关闭。
+工程上应区分：
 
-控制反馈：runtime 会根据上次 GC 的总耗时（用户 CPU + GC CPU）动态调整触发时机，把 GC CPU 占比收敛到 ~25%（即 `GOGC=100` 时的目标）。
+- **分配速率**：用 benchmark `-benchmem` 和 allocs profile。
+- **存活堆**：用 in-use heap profile 查持有链。
+- **扫描量**：用 `/gc/scan/*` 查指针密度和根集。
+- **Runtime 总内存**：用 `/memory/classes/total:bytes - /memory/classes/heap/released:bytes`。
+- **RSS/cgroup working set**：用 OS/容器指标，它还包含 cgo、mmap、代码映射等内容。
 
-**3. 工程实践与常见坑**
+详见[第20章 内存管理](./20-内存管理.md)。
 
-- **`GODEBUG=gctrace=1`**：每次 GC 输出形如 `gc 1 @0.045s 1%: 0.013+0.36+0.022 ms clock, 0.026+0.17+0.40 ms cpu, 4->4->2 MB, 5 MB goal, 0 MB stacks, 0 MB globals, 4 P`。重点关注：
-  - 中间百分比（1%）：GC CPU 占比；
-  - 后两个堆数字（4->4->2 MB）：GC 前活堆 → GC 后活堆 → 当前活堆；
-  - `goal`：下次触发目标。
-- **降分配**：每次分配都会让堆更快达到 goal，提前触发 GC。`sync.Pool`、`bytes.Buffer` 复用是首要手段；`pprof allocs` 找热点。
-- **大对象直接进堆**：>32KB 走 mheap，没有 mcache 缓冲，频繁分配大对象会让 GC mark/sweep 都吃力。
-- **`debug.SetGCPercent(-1)` 不等于关 GC**：仅是"不到堆翻倍就别触发"，但 GOMEMLIMIT、forcegc、显式 `runtime.GC()` 仍会触发。
-- **`GOMEMLIMIT` 在容器里的意义**：把它设成 cgroup 内存上限的 ~90%，能避免 OOM Kill 引起整进程崩溃；但太接近真实使用会让 GC 自适应变得激进。
-- **不要 `runtime.GC()` 来"清理"**：除非做基准测试或测试 leak。生产里频繁手动 GC 反而打乱自适应反馈。
-- **指针 vs 值**：`[]byte` 的 backing array 不含指针，扫描成本低；`[]*Foo` 让 GC 跟踪每个元素。编译器根据类型选择 noscan 的 span class，分配和扫描都更快。
+### 调试与观测清单
 
-更多细节见 [第21章 GC](./21-GC.md)。
+| 目标 | 工具 |
+|---|---|
+| 调度器瞬时状态 | `GODEBUG=schedtrace=1000,scheddetail=1` |
+| goroutine 等待栈 | goroutine profile、`go tool pprof` |
+| 时序、阻塞、syscall、GC | `go tool trace` |
+| CPU 热点 | CPU profile |
+| 累计分配 | allocs profile |
+| 当前持有 | in-use heap profile |
+| 锁竞争 | mutex/block profile（先理解采样率和开销） |
+| GC 快速摘要 | `GODEBUG=gctrace=1` |
+| 持续 Runtime 数据 | `runtime/metrics` |
+| 数据竞争 | `go test -race ./...` |
+| 逃逸决策 | `go build -gcflags='-m=2' ./...` |
 
----
+高频调用 `runtime.Stack`、全量 mutex/block profile 或过长 trace 都会扰动被观测系统。生产排查应使用限时采集、适当采样率，并保存 Go 版本、环境变量和负载上下文。
 
-### 内存管理
+### 常见误区
 
-**1. 是什么**
-
-Go 的堆分配器借鉴 TCMalloc，采用 **多级缓存 + 多级中心化** 设计：每个 P 持有 `mcache`（无锁快路径）→ 全局按 size class 持有 `mcentral`（带锁中路径）→ 全局 `mheap` 管理所有 page（慢路径）。再叠加 **Tiny Allocator**（<16B 无指针小对象合并）、**栈分配**（逃逸分析决定）、**mmap arena**（按 64MB 切大块）等机制。
-
-**2. 底层实现要点（速览）**
-
-对象按 size class 分配。Go 1.21 共 67 个 span class（每个 8B 起步），加上 noscan 变体共 136 个：
-
-| Size class | 元素大小 | 一次 span 元素数 | span 页数 |
-| --- | --- | --- | --- |
-| 1 | 8 B | 8192 | 1 |
-| 2 | 16 B | 4096 | 1 |
-| 3 | 24 B | 2730 | 1 |
-| ... | ... | ... | ... |
-| 67 | 32768 B | 8 | 8 |
-
-每页 8KB。`mspan` 把若干连续页打包，按 size class 提供定长对象槽。
-
-多级缓存全景图：
-
-```
-                   用户 mallocgc(size)
-                          │
-                ┌─────────┴──────────┐
-                │  逃逸？  size<=16B  │
-                │  否 → 栈分配         │
-                │  是 → 堆分配         │
-                └─────────┬──────────┘
-                          │
-              ┌───────────┴────────────┐
-              │ P.mcache (无锁快路径)    │
-              │  tiny / alloc[sizeclass]│
-              └───────────┬────────────┘
-                  miss →  │ refill
-              ┌───────────┴────────────┐
-              │ mcentral[136] (每 class)│
-              │  partial / full 链表    │  ← 锁
-              └───────────┬────────────┘
-                  miss →  │ grow
-              ┌───────────┴────────────┐
-              │ mheap (page 分配)        │
-              │  arena / treap / busy   │
-              └────────────────────────┘
-                          │
-                  mmap (arena 64MB / 64位)
-```
-
-`mheap` 把地址空间切成 **arena**（64 位下 64MB 一块），arena 内按 8KB page 索引。分配大对象（>32KB）直接走 mheap，从 `free` 树里找连续 page。空闲 page 用 **treap**（笛卡尔树，按 page 起始地址与随机优先级组织）维护，方便合并相邻页。
-
-> 关键文件：`src/runtime/mheap.go`、`mcache.go`、`mcentral.go`、`mspan.go`、`malloc.go`、`sizeclasses.go`（67 类定义）、`mheap_*.go`（按平台）。详见 [第20章 内存管理](./20-内存管理.md)。
-
-**3. 工程实践与常见坑**
-
-- **逃逸分析**：`go build -gcflags='-m'` 看哪些变量逃逸。常见逃逸源：返回局部变量指针、闭包捕获、`interface{}` 参数（编译期未知大小）、`[]byte(s)` 转换。少逃逸 = 多栈分配 = 0 GC 压力。
-- **栈分配 ≠ 永远不付出代价**：栈太大会 `morestack` 触发栈拷贝（goroutine 栈按需扩展，最大 1GB）。
-- **`make([]T, n)` 的代价**：n 较大且 T 含指针时，分配 + 初始化 + 后续 GC 扫描都不便宜；能用 `sync.Pool` 就别每次 make。
-- **`unsafe.Sizeof` vs `runtime.KeepAlive`**：让对象看似逃逸但实际栈分配有时会引入 use-after-free 隐患（CGO 场景），靠 `runtime.KeepAlive` 兜底。
-- **不要 `unsafe.Pointer` 跨 goroutine 传堆地址给"未逃逸"对象**：逃逸分析是函数级的，跨函数边界后编译器可能错过。这是"看似安全实则悬挂指针"的典型坑。
-- **mcache 与 P 强绑定**：被 `LockOSThread` 的 goroutine 仍然在某个 P 上跑，mcache 来自该 P；`GOMAXPROCS=1` 时只有一份 mcache，所有分配都串行化同一缓存——压测时这一点会让某些无锁优化失效。
-
-更多细节见 [第20章 内存管理](./20-内存管理.md)。
-
----
+- **`GOMAXPROCS(1)` 不是 race detector**：goroutine 仍会交错执行，未同步访问仍违反内存模型；用 `-race` 和正确同步。
+- **`runtime.LockOSThread` 不是普通性能优化**：它用于线程局部状态、GUI、特定 cgo/API 约束等场景，必须设计清晰的解锁和退出路径。
+- **接口转换不必然堆分配**：是否逃逸取决于数据流、类型和编译器优化，用 `-m=2` 验证。
+- **返回局部变量指针是内存安全的**：编译器会在需要时把对象放到堆上；问题是分配成本，不是悬挂指针。
+- **`unsafe.Pointer`/`uintptr` 可以隐藏指针语义**：不要把 Go 指针长期存为 `uintptr`；遵循 `unsafe` 和 cgo 规则，必要时用 `runtime.KeepAlive`/`runtime.Pinner`。
+- **频繁手动 `runtime.GC()` 不是内存治理**：它会强制周期，不会回收仍可达对象；先查 heap profile、分配速率与保留链。
+- **Runtime 指标名不能凭记忆拼接**：用 `runtime/metrics.All()` 发现支持指标与 `ValueKind`。
 
 ### 本章小结
 
-- Runtime 是一段与用户代码静态链接的"嵌入式微内核"，覆盖调度、内存、GC、栈、网络、信号、timer 等基础设施，由编译器在每处插入的调用与屏障协同工作。
-- 启动从汇编入口 `rt0_go` 出发，经 `schedinit` 初始化全局 sched、mheap、P 池与 mcache，再用 `newproc` 创建主 goroutine，最终在 `runtime.main` 里跑包级 `init` 和用户 `main`。
-- 调度器以 G-M-P 模型组织，本地队列优先 + 全局队列兜底 + work stealing + 网络 poller + sysmon 异步抢占，把 goroutine 切换开销压到 ~200ns 级。
-- GC 是并发三色标记-清除 + 混合写屏障，靠 `GOGC`/`GOMEMLIMIT` 控制触发，目标是低尾延迟而非极限吞吐。
-- 内存分配走 TCMalloc 风格的 mcache → mcentral → mheap 三级路径，小对象走 size class、大对象直接走 mheap，逃逸分析决定栈/堆。
-
-掌握本章的"地图"后，[第20章 内存管理](./20-内存管理.md) 将深入每一级缓存的数据结构，[第21章 GC](./21-GC.md) 与 [第12章 Goroutine](./12-Goroutine.md) 会各自展开实现细节。
+- Runtime 与编译器共同实现调度、栈、分配、GC、poller、timer 和多种语言内建操作。
+- 启动主线从平台 `rt0_*` 到 `schedinit`、`runtime.main`、包初始化和用户 `main.main`；跨文件 `init` 顺序不应成为业务契约。
+- 调度器用 G-M-P、本地/全局队列、work stealing、netpoll 与抢占组织并发执行。
+- Go 1.25+ 的默认 `GOMAXPROCS` 可感知 Linux cgroup CPU quota 并自动更新；显式设置会禁用这一行为。
+- Go 1.26 默认使用 Green Tea GC；根工作在并发 mark 中执行，暂停时间没有固定保证。
+- 分配器主干是 tiny/small/large 分流与 `mcache -> mcentral -> mheap/pageAlloc`；当前页分配器不是历史 treap。
+- 任何 Runtime 调优都应从 metrics、profile、trace 和代表性 benchmark 开始，不从固定纳秒、阈值或比例开始。

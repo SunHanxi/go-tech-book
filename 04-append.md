@@ -98,7 +98,7 @@ func main() {
 
 **是什么**
 
-`runtime.growslice` 是 Runtime 中真正负责 Slice 扩容的函数。当 `append` 发现容量不足时，会调用它。Go 1.21+ 中的函数签名如下：
+`runtime.growslice` 是当前 Runtime 负责 Slice 扩容的入口。下面签名以 Go 1.26 为准；它属于私有 ABI，历史版本可能不同：
 
 ```go
 // runtime/slice.go
@@ -124,49 +124,30 @@ func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice 
     oldLen := newLen - num
 
     // 1. 元素大小为 0 的特殊处理
-    if et.size == 0 {
-        return slice{unsafe.Pointer(&zerobase), newLen, max(newLen, oldCap)}
+    if et.Size_ == 0 {
+        return slice{unsafe.Pointer(&zerobase), newLen, newLen}
     }
 
-    // 2. 计算新容量 newcap
-    newcap := oldCap
-    doublecap := newcap + newcap
-    if newLen > doublecap {
-        newcap = newLen
+    // 2. 计算候选容量；3. 按元素大小和 size class 圆整字节数
+    newcap := nextslicecap(newLen, oldCap)
+    noscan := !et.Pointers()
+    capmem, newcap := roundCapacity(newcap, et.Size_, noscan) // 概念辅助函数
+    lenmem := uintptr(oldLen) * et.Size_
+    newlenmem := uintptr(newLen) * et.Size_
+
+    // 4. 分配新内存：概念分支，省略溢出和写屏障细节
+    var p unsafe.Pointer
+    if noscan {
+        p = mallocgc(capmem, nil, false)
+        // 只清 append 不会立即覆盖的尾部
+        memclrNoHeapPointers(add(p, newlenmem), capmem-newlenmem)
     } else {
-        const threshold = 256
-        if oldCap < threshold {
-            newcap = doublecap
-        } else {
-            for 0 < newcap && newcap < newLen {
-                newcap += (newcap + 3*threshold) / 4
-            }
-            if newcap <= 0 {
-                newcap = newLen
-            }
-        }
+        p = mallocgc(capmem, et, true)
+        // 当前实现还会在需要时执行批量写屏障
     }
-
-    // 3. 根据元素大小对齐到内存分配器的尺寸类（size class）
-    var capmem uintptr
-    switch {
-    case et.size == 1:
-        capmem = roundupsize(uintptr(newcap))
-        newcap = int(capmem)
-    case et.size == 2:
-        capmem = roundupsize(uintptr(newcap) * 2)
-        newcap = int(capmem / 2)
-    case et.size == 4:
-        capmem = roundupsize(uintptr(newcap) * 4)
-        newcap = int(capmem / 4)
-    // ... 其他 size 分支
-    }
-
-    // 4. 分配新内存（true 表示清零）
-    p := mallocgc(capmem, et, true)
 
     // 5. 把旧元素拷贝到新内存
-    memmove(p, oldPtr, uintptr(oldLen)*et.size)
+    memmove(p, oldPtr, lenmem)
 
     return slice{p, newLen, newcap}
 }
@@ -174,27 +155,27 @@ func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice 
 
 几个关键设计点：
 
-1. **`et.size == 0` 的特判**：空结构体 `struct{}` Slice 不占用实际数据内存，所有元素"指向"同一个全局变量 `runtime.zerobase`。扩容只调整 `len`/`cap`，零分配。但 Slice 头本身仍存在。
+1. **`et.size == 0` 的特判**：空结构体 `struct{}` slice 不需要元素载荷内存。Go 1.26.4 的 `growslice` 返回以 `runtime.zerobase` 为数据指针的结果并只更新 `len`/`cap`；零大小对象的地址是否相等不是语言契约。Slice 头本身仍存在。
 
 2. **三段式容量计算**：`newLen > 2*oldCap` 时直接采用 `newLen`；`oldCap < 256` 时翻倍；超过 256 后走平滑过渡。这部分在 4.3 节展开。
 
-3. **`roundupsize` 对齐**：Go 的内存分配器（`runtime.mallocgc`）按 size class 分配（参考 `runtime/sizeclasses.go`），如果直接按 `newcap * et.size` 申请会浪费内存或返回过大的块。`roundupsize` 把请求字节数向上取整到最近的 size class，从而得到实际分配的字节数，反推回 `newcap`。这就是为什么 `cap` 经常不等于你预期的 `2*oldCap`。
+3. **`roundupsize` 对齐**：Go 的小对象分配器使用 size class，大对象按 page 对齐。`roundupsize` 把 `newcap * et.Size_` 圆整到分配器可提供的字节数，再反推实际 `newcap`。元素是否含指针还会影响 malloc header 与圆整路径，因此 `cap` 不只由元素个数决定。
 
-4. **`memmove` 拷贝**：用 `memmove` 而非 `for` 循环逐元素拷贝，因为 `memmove` 是经过高度优化的 SIMD 实现，对小块也能批量搬运。注意 `memmove` 允许源和目标重叠，但这里源和目标是两块独立内存，所以不会有重叠问题。
+4. **`memmove` 拷贝**：Runtime 用架构相关的 `memmove` 搬运旧元素。它可能使用向量化或针对小尺寸的专门路径；程序不应依赖具体指令。扩容时源、目标是不同分配。
 
-5. **零值初始化**：`mallocgc(..., true)` 的第三个参数表示返回的内存需要清零。这样追加位置之后的元素都是零值，不会泄露之前被释放对象的内容（安全考虑）。
+5. **清零与写屏障**：含指针元素使用带类型信息的 `mallocgc`，新区域必须保持可安全扫描的零值，并在复制旧指针时配合批量写屏障。无指针元素可省去扫描和部分清零，只清理本次 append 不会覆盖的尾部。
 
 **工程实践与常见坑**
 
-- **不要假设 `cap` 一定翻倍**：很多人记得"Go Slice 扩容是 2 倍"，但实际上由于 `roundupsize` 对齐，`cap` 的实际值经常不是精确的 `2*oldCap`。例如 `make([]int, 0, 1)` 后 append 一个 int，得到的 `cap` 是 2；但 `make([]int, 0, 1000)` append 后的值可能是 1280 或其它。详见 4.6 节。
-- **大 Slice 扩容代价高**：`memmove` 是 O(n) 操作。如果 Slice 已经有几百万个元素，每次扩容都会触发一次百万级的拷贝。生产环境请务必预分配容量。
+- **不要假设 `cap` 一定翻倍**：很多人记得"Go Slice 扩容是 2 倍"，但实际还受 `nextslicecap`、元素大小和 `roundupsize` 影响。例如 `make([]int, 1000, 1000)` 再 append 才会触发扩容；`make([]int, 0, 1000)` 的第一次 append 容量仍是 1000。
+- **大 Slice 扩容代价可能很高**：对非零大小元素，增长需要保留已有元素，真实搬运量为 O(n)。能可靠估计最终规模时预分配通常有益；输入上界不可信或估计偏差很大时，应在复制成本与闲置内存之间权衡。
 - **零大小元素也有开销**：`[]struct{}` 虽然不分配数据内存，但 Slice 头本身仍要分配，且 Runtime 仍要维护 `len`/`cap`。
 
 ### 4.3 扩容算法
 
 **是什么**
 
-Go Slice 的扩容算法决定 `append` 时新 `cap` 的取值。算法在 Go 1.18 做过一次重要调整，从"硬阈值 1024"改为"基于 256 的平滑过渡"，Go 1.21 沿用新算法。
+Go Slice 的扩容算法决定 `append` 时新 `cap` 的取值。算法在 Go 1.18 做过一次重要调整，从"硬阈值 1024"改为"基于 256 的平滑过渡"；Go 1.26.4 仍使用这条主线。
 
 **为什么这样设计 / 底层实现要点**
 
@@ -238,9 +219,9 @@ if newLen > doublecap {
 
 1. **内存利用率**：旧算法在 `oldCap >= 1024` 之后一刀切为 1.25 倍，导致在 512~2048 区间内扩容行为不够平滑——小 Slice 浪费内存（翻倍后用不到），中 Slice 又扩得太少。新算法通过 `newcap += (newcap + 3*threshold)/4 = newcap*1.25 + 192` 的循环，让增长系数从 2.0 平滑过渡到 1.25。
 
-2. **避免一次性跨度过大**：当 `newLen` 远大于 `oldCap` 时（例如一次性 `append(s, bigSlice...)`），算法可能需要多次循环才能到达。循环内每次加上 `(newcap + 3*threshold)/4`，相当于在保留平滑增长的同时让算法在 O(log(newLen-oldCap)) 步内收敛。
+2. **批量追加直接满足需求**：当 `newLen > 2*oldCap` 时直接返回 `newLen`，不会从旧容量逐级循环增长。平滑循环只处理目标没有超过两倍旧容量的情况。
 
-3. **`threshold = 256` 的选择**：与 Go 内存分配器的 size class 边界对齐较好，256 字节正好是某些分配路径的一个分界点，便于缓存与对齐。
+3. **`threshold = 256` 是元素数阈值**：它不是 256 字节，也不对应所有元素类型的同一个 size class。它属于 Runtime 在扩容次数与闲置容量之间的实现权衡。
 
 > 新算法等价于：当 `oldCap < 256` 时 `newcap = max(newLen, oldCap*2)`；之后每次按 `newcap = newcap*1.25 + 192` 增长直到不小于 `newLen`。
 
@@ -262,7 +243,7 @@ if newLen > doublecap {
 
 - **不要依赖精确的 `cap` 值**：算法会随 Go 版本变化，代码里写死 `cap` 判断是反模式。
 - **大 Slice 的扩容倍数更接近 1.25**：对几百万级别的 Slice，每次扩容只多 25% 左右，意味着频繁扩容。务必预分配。
-- **批量 append 比 append 多次更快**：`s = append(s, arr...)` 只触发一次扩容判断，而循环 `for _, x := range arr { s = append(s, x) }` 可能触发多次。但现代编译器会做 `append` 链优化，差距不如想象中大；可读性更重要。
+- **批量 append 能一次表达所需增长量**：`s = append(s, arr...)` 可一次检查容量并批量复制；逐项循环可能经历多次增长，但如果容量已预留，两者路径会不同。性能差距取决于元素类型、内联和输入规模，按语义选择并对热点测量。
 
 ### 4.4 为什么 append 返回新的 Slice
 
@@ -448,7 +429,7 @@ func main() {
 }
 ```
 
-- **`copy` 与 `append` 的取舍**：`copy` 比循环 `append` 快，因为它直接调 `memmove`。当知道目标容量时优先 `copy`。
+- **`copy` 与 `append` 的取舍**：目标长度已确定且只是搬运元素时，`copy` 能直接表达批量复制，编译器/Runtime 可使用 `memmove`；`append(dst, src...)` 也可能走高效批量路径并负责增长。按语义选择，再对热点 benchmark，不要宣称 `copy` 在所有情况下必然更快。
 
 ### 4.6 cap 的变化规律
 
@@ -458,26 +439,14 @@ func main() {
 
 **为什么这样设计 / 底层实现要点**
 
-回顾 `growslice`：先算 `newcap`（基于翻倍/平滑过渡），再通过 `roundupsize` 对齐到 size class。`runtime/sizeclasses.go` 定义了 Go 内存分配器的尺寸类（部分）：
+回顾 `growslice`：先算理论 `newcap`，再通过 `roundupsize` 对齐。小对象使用 size class，大对象按 page 圆整。`internal/runtime/gc/sizeclasses.go` 定义了小对象尺寸类；Go 1.26.4 的部分可用字节数如下，编号和整张表都是实现细节：
 
-| sizeclass | 字节数 |
-|---|---|
-| 1 | 8 |
-| 2 | 16 |
-| 3 | 24 |
-| 4 | 32 |
-| 5 | 48 |
-| 6 | 64 |
-| 7 | 80 |
-| ... | ... |
-| 30 | 256 |
-| ... | ... |
-| 36 | 512 |
-| ... | ... |
+| 8 | 16 | 24 | 32 | 48 | 64 | 80 | 128 | 256 | 512 | 896 | 1024 | 1536 | 2048 | 4096 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 
-`roundupsize(n)` 会把 `n` 字节向上取整到最近的 size class 字节数。这就是为什么 `cap` 的实际值经常比预期"大一点"。
+`roundupsize(n)` 会把请求向上圆整到分配器可提供的大小。这就是为什么实际 `cap` 经常与理论值不同。
 
-下面是 `[]int64`（`et.size=8`）在不同初始 `cap` 下 `append` 一次后**实际测得**的 `cap`（Go 1.21，AMD64）：
+下面把 `len` 和 `cap` 都设为 n，再 append 一个 `int64`，确保触发扩容。结果来自 Go 1.26.4、darwin/arm64，只用于说明圆整效应：
 
 | 初始 cap | 期望 (翻倍) | 实测 cap | 说明 |
 |---|---|---|---|
@@ -485,13 +454,15 @@ func main() {
 | 2 | 4 | 4 | 32 字节正好是 sizeclass 4 |
 | 4 | 8 | 8 | 64 字节正好是 sizeclass 6 |
 | 8 | 16 | 16 | 128 字节正好匹配 |
-| 16 | 32 | 32 | 256 字节正好是 sizeclass 30 |
-| 32 | 64 | 64 | 512 字节正好是 sizeclass 36 |
+| 16 | 32 | 32 | 256 字节正好匹配 |
+| 32 | 64 | 64 | 512 字节正好匹配 |
 | 64 | 128 | 128 | 1024 字节匹配 |
 | 128 | 256 | 256 | 2048 字节匹配 |
 | 256 | 512 | 512 | 阈值边界，理论翻倍后对齐仍为 512 |
-| 512 | 1024 | 896 | 进入平滑过渡，理论 newcap=832，对齐到 896 |
-| 1024 | 2048 | 1488 | 理论 newcap=1472，对齐后约 1488 |
+| 512 | 1024 | 848 | 理论 newcap=832，6656 字节圆整到 6784 |
+| 1024 | 2048 | 1536 | 理论 newcap=1472，11776 字节圆整到 12288 |
+| 2048 | 4096 | 3072 | 理论 newcap=2752，再按 size class 圆整 |
+| 4096 | 8192 | 6144 | 理论 newcap=5312，大对象按 page 圆整 |
 
 > 上表数据会随 Go 版本与平台变化，请以你本机实测为准。可以用下面的程序验证。
 
@@ -503,7 +474,7 @@ package main
 import "fmt"
 
 func capAfterAppend(n int) int {
-    s := make([]int64, 0, n)
+    s := make([]int64, n, n)
     s = append(s, 1)
     return cap(s)
 }
@@ -518,14 +489,14 @@ func main() {
 运行后你会发现：
 
 - 小 Slice（`oldCap < 256`）基本是精确翻倍。
-- 大 Slice 进入平滑过渡，扩容倍数接近 1.25，但因 size class 对齐实际值会略有放大。
-- 偶尔因为 size class 对齐，实际 `cap` 比"理论 `newcap`"还要大。
+- 大 Slice 进入平滑过渡，理论增长系数逐渐接近 1.25，但 size class 或 page 圆整会改变实际比例。
+- size class 或 page 圆整会让实际 `cap` 大于理论 `newcap`。
 
 **工程实践与常见坑**
 
 - **不要硬编码 `cap`**：基于 `cap` 的精确值写逻辑会让代码与 Go 版本耦合。
-- **预分配避免依赖扩容**：`make([]T, 0, expected)` 一次到位，不触发任何扩容。
-- **观察 GC 压力**：如果 `cap` 增长不符合预期，可能是 size class 对齐导致内存放大。可以用 `runtime.ReadMemStats` 监控。
+- **预分配避免依赖扩容**：若最终长度不超过 expected，`make([]T, 0, expected)` 不需要扩容；低估仍会增长，高估则会保留闲置容量。
+- **观察分配与保留**：用 `-benchmem`、alloc profile 和 heap profile 判断扩容与过度预分配，不从某次 `cap` 猜整体 GC 压力。
 
 ### 4.7 扩容性能分析
 
@@ -543,15 +514,15 @@ func main() {
 1 + 2 + 4 + 8 + ... + n/2 + n ≈ 2n - 1
 ```
 
-n 次 `append` 总拷贝 `O(n)`，均摊每次 `O(1)`。即使大 Slice 用 1.25 倍扩容，均摊仍是 `O(1)`（因为几何级数收敛）。这是动态数组能作为通用数据结构的核心保证。
+在当前几何增长实现下，n 次逐项 append 的总元素搬运为 O(n)，均摊每次 O(1)；大容量路径趋近 1.25 倍也仍满足几何级数收敛。这是实现提供的重要性能性质，不是规范对未来 `cap` 策略的固定承诺。
 
 **缓存友好性**：
 
-Slice 的底层数组是连续内存，对 CPU L1/L2 缓存非常友好。顺序 `append`、顺序遍历是 Go 中最高效的内存访问模式之一。相比之下，链表（如 `container/list`）的节点分散在堆上，缓存命中率差。
+Slice 的连续 backing store 通常有利于顺序访问的 cache locality。链表节点往往分散且多一次指针追踪，但实际差距受元素大小、访问模式、预取、逃逸和算法复杂度影响；不能脱离 workload 宣称某一种访问路径“最高效”。
 
 **内存分配开销**：
 
-`mallocgc` 调用涉及 mcache/mcentral/mheap 三级分配（参见内存分配章节）。小 Slice（<= 32KB）通常从 P 的 mcache 拿，无锁；大 Slice 走 mcentral 加锁；超大 Slice（> 32KB）直接 mmap。每次扩容都是一次分配 + 一次 `memmove` + 一次旧内存释放（GC 回收）。
+`mallocgc` 调用涉及 tiny/small/large 分流以及 mcache、mcentral、mheap/pageAlloc（参见内存管理章节）。不超过当前 `MaxSmallSize` 的小对象可从 P 的 mcache 快速分配；refill 与大对象需要进入更下层分配器。大对象从页分配器取得连续 page，不是“每个对象直接 mmap”。扩容通常包含新分配和 `memmove`；旧数组只有在不再可达后才由 GC 回收。
 
 **Benchmark 对比**：
 
@@ -579,21 +550,14 @@ func BenchmarkAppendPrealloc(b *testing.B) {
 }
 ```
 
-典型结果（Go 1.21，AMD64）：
-
-| Benchmark | 时间/操作 | 内存/操作 | 分配次数 |
-|---|---|---|---|
-| `AppendDynamic` | ~5 µs | ~12 KB | ~10 |
-| `AppendPrealloc` | ~1 µs | ~8 KB | 1 |
-
-预分配版本快约 5 倍，内存省 30%，分配次数从 10 次降到 1 次。
+运行结果必须附 CPU、GOOS/GOARCH、Go 版本和统计方法。这个输入下预分配通常会减少扩容与分配总字节数，但具体时间、分配次数和容量圆整随工具链与元素类型变化；用 `-count` 配合 `benchstat` 比较，不引用“固定快 5 倍”。
 
 **工程实践与常见坑**
 
-- **能预分配就预分配**：哪怕只能估个大概，也比完全不预估强。`make([]T, 0, hint)` 几乎没有副作用。
+- **按可信上限预分配**：合理 hint 能减少复制；严重高估会增加保留内存、清零和 GC 扫描成本。输入不可信时先设置容量上限。
 - **批量 `append`**：`s = append(s, bigSlice...)` 一次扩容到位，比循环 append 触发的扩容次数少。
 - **复用 Slice**：用 `s = s[:0]` 重置长度，保留底层数组，避免重复分配。但要注意 GC 不会回收底层数组里被"逻辑删除"的对象引用（详见 4.8 节）。
-- **避免在热路径上扩容**：性能敏感的 RPC 序列化、网络包处理等场景，务必在初始化时分配好缓冲区。
+- **在热点中验证扩容成本**：序列化、网络处理等路径可根据历史分布设置 hint 或复用有上限的缓冲区，并用 profile 验证；不要为避免扩容而无界预留。
 
 ### 4.8 GC 如何处理旧数组
 
@@ -702,11 +666,11 @@ s = s[:0]
 
 **工程实践与常见坑**
 
-**1. 永远接收 `append` 返回值**
+**1. 使用 `append` 返回值**
 
 ```go
 s = append(s, x)        // 正确
-append(s, x)            // 错误：vet 会报警告
+append(s, x)            // 编译错误：返回值未使用
 ```
 
 **2. 知道大小时预分配**
@@ -724,7 +688,7 @@ for i := 0; i < n; i++ {
     s = append(s, i)
 }
 
-// 也可以直接 make 长度 + 索引赋值（最快）
+// 也可以直接 make 长度 + 索引赋值；热点性能以 benchmark 为准
 s := make([]int, n)
 for i := range s {
     s[i] = i
@@ -841,10 +805,10 @@ func main() {
 本章围绕 `append` 展开，核心要点：
 
 1. `append` 在容量足够时原地写、容量不足时调 `growslice` 分配新数组并 `memmove` 拷贝。
-2. Go 1.18+ 的扩容算法用 256 阈值 + 平滑过渡替代了旧的 1024 阈值，`roundupsize` 进一步对齐到 size class，使 `cap` 实际值常与理论值有出入。
+2. Go 1.18+ 的扩容算法用 256 阈值 + 平滑过渡替代了旧的 1024 阈值；`roundupsize` 再按 size class 或 page 圆整，使实际 `cap` 常与理论值不同。
 3. Slice 头是值类型，`append` 必须接收返回值，否则丢失扩容结果。
 4. `copy` 用 `memmove` 实现，是安全、高效的 Slice 复制手段。
 5. GC 通过 Slice 头的 `array` 指针追踪底层数组，"大数组小引用"是常见的隐性内存泄漏。
-6. 工程实践：预分配、`copy` 切断共享、`slices` 标准库优先。
+6. 工程实践：按可信容量 hint 预分配、用 `copy` / `slices.Clone` 切断共享，并用 benchmark/profile 验证热点。
 
-理解 `append` 等于理解 Slice 的动态行为，下一章我们将进入 Go Map 的内部世界，看 Go 如何用 bucket + overflow 实现一个高性能的 HashMap。
+理解 `append` 等于理解 Slice 的动态行为，下一章将进入 Go Map，分析 Go 1.24+ 的 Swiss Table 与旧 bucket 实现的版本差异。

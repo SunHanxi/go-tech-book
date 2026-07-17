@@ -291,9 +291,11 @@ value, loaded := m.LoadAndDelete("key")
 m.Clear() // Go 1.23+
 ```
 
-`CompareAndSwap` 的 old 必须可比较。`Range` 不是一致性快照：一次遍历可能观察到 key 在不同时间点的值，且回调返回 false 才停止。
+`CompareAndSwap` / `CompareAndDelete` 的 old 必须可比较。`Range` 不是一致性快照：一次遍历可能观察到各 key 在不同时间点的值，回调返回 false 时停止；即便很早停止，API 仍允许其复杂度达到 O(N)。
 
-当前实现维护适合无锁读取的 read 视图和受锁保护的 dirty 视图；miss 达到阈值时提升 dirty。它的收益依赖访问模式，写密集或需要多 key 事务不适合。
+Go 1.26.4 的 `sync.Map` 是 `internal/sync.HashTrieMap[any, any]` 的包装，不再是旧资料中的 `read/dirty/miss` 双表。当前哈希 trie 的内部节点有原子发布的子指针：读取沿哈希路径遍历，修改锁住相关内部节点并发布新节点，哈希完全冲突时使用 overflow 链；`Clear` 通过替换根节点清空。内部结构不是兼容性承诺，选型仍应以公开语义和 benchmark 为准。
+
+`sync.Map` 的 key 必须可比较，且它没有 `Len`；涉及多 key 不变量、类型安全或一致性快照时，普通 `map[K]V` 配合锁通常更合适。
 
 ### 5.12 性能与内存
 
@@ -392,4 +394,3 @@ Map、slice、pointer、interface 作为 value 时，Clone 不复制其指向对
 - [Go map implementation, Go 1.26](https://cs.opensource.google/go/go/+/refs/tags/go1.26.0:src/internal/runtime/maps/map.go)
 - [Abseil Swiss Tables](https://abseil.io/about/design/swisstables)
 - [Go specification: map types](https://go.dev/ref/spec#Map_types)
-

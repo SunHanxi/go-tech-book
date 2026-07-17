@@ -120,7 +120,7 @@ Go 1.22 的 ServeMux 支持方法、通配符和 `Request.PathValue`。复杂路
 - `WriteTimeout`：响应写出的上限；流式响应需要单独设计。
 - `IdleTimeout`：keep-alive 连接等待下一请求的时间。
 
-业务处理还应使用 context deadline；连接超时不能替代下游调用超时。
+示例中的数值不是通用默认值。应根据请求体大小、正常延迟分位数、流式协议和上游重试预算设定，并用超时指标持续校准。业务处理还应使用 context deadline；连接超时不能替代下游调用超时。
 
 ### 26.5 限制请求体与严格解码
 
@@ -148,7 +148,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 
 ### 26.6 Handler 与 Context
 
-客户端断开、HTTP/2 流取消或 Server 关闭时，`r.Context()` 会被取消。下游调用必须透传它：
+客户端连接关闭、HTTP/2 请求取消或 `ServeHTTP` 返回时，`r.Context()` 会被取消。`Server.Shutdown` 本身不会取消仍在处理的请求；如果停机时需要通知 handler，应把应用生命周期 context 通过 `Server.BaseContext` 或自己的取消机制传入。下游调用必须透传请求 context：
 
 ```go
 func itemHandler(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +208,8 @@ client := &http.Client{
 
 `Client.Timeout` 覆盖连接、重定向和读取 body 的整个过程。复杂系统通常还会分别配置 Dial、TLS handshake、response header 和业务 context deadline，便于定位是哪一段超时。
 
+这些连接池上限同样只是容量示例，应按目标主机数、实例并发和下游容量计算。拥有自定义 Transport 的组件在最终退出时可调用 `transport.CloseIdleConnections()`；不要在每个请求后调用，否则会破坏复用。
+
 每个响应都必须关闭 body：
 
 ```go
@@ -260,10 +262,16 @@ case err := <-errCh:
 
 shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 defer cancel()
-return server.Shutdown(shutdownCtx)
+if err := server.Shutdown(shutdownCtx); err != nil {
+    _ = server.Close() // 超出预算后强制关闭 net/http 管理的连接
+    return fmt.Errorf("shutdown HTTP server: %w", err)
+}
+return nil
 ```
 
-Kubernetes 中还应先让 readiness 失败，等待 Endpoint 传播，再调用 Shutdown。后台 worker、消息消费者和数据库连接也要纳入同一个有序停机流程。
+`Shutdown` 只等待 `net/http` 管理的连接变为空闲，不会关闭经 `Hijacker` 接管的连接，例如 WebSocket。可用 `RegisterOnShutdown` **发起**这类协议自己的关闭流程，但回调应立即返回，且 `Shutdown` 不等待这些回调完成；应用还要用独立的 `WaitGroup` 或等价机制等待它们，并把等待纳入同一个总预算。
+
+Kubernetes 中还应先让 readiness 失败，等待 Endpoint 传播，再调用 Shutdown。示例中的 20 秒必须小于 Pod 的总终止宽限期，并为流量摘除和最终清理留出余量。后台 worker、消息消费者和数据库连接也要纳入同一个有序停机流程。
 
 ### 26.11 测试与排障
 
@@ -285,5 +293,4 @@ Kubernetes 中还应先让 readiness 失败，等待 Endpoint 传播，再调用
 
 - [Package io](https://pkg.go.dev/io)
 - [Package net/http](https://pkg.go.dev/net/http)
-- [Go blog: HTTP server and client timeouts](https://go.dev/blog/context)
-
+- [Go blog: Go Concurrency Patterns: Context](https://go.dev/blog/context)

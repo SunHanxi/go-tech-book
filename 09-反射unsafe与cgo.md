@@ -199,9 +199,19 @@ defer h.Delete()
 
 ```go
 var pinner runtime.Pinner
-pinner.Pin(&buffer[0])
-defer pinner.Unpin()
+if len(buffer) != 0 {
+    ptr := unsafe.SliceData(buffer)
+    pinner.Pin(ptr)
+    registerWithC(unsafe.Pointer(ptr), len(buffer))
+
+    // C 确认不再保存或访问 ptr 后，才能解除固定。
+    unregisterFromC(unsafe.Pointer(ptr))
+    runtime.KeepAlive(buffer)
+    pinner.Unpin()
+}
 ```
+
+长度检查既避免 `&buffer[0]` 对空 slice panic，也避免尝试固定无实际元素的地址。实际代码应把 `Pinner`、buffer 和 C 侧注册句柄封装进同一个有明确 `Close` 生命周期的对象，并防止重复释放。
 
 `Pinner` 不是通行证：被固定区域若包含 Go 指针，相关对象也必须满足固定规则；slice、string、interface 本身包含指针，不能把它们的描述符随意交给 C 长期保存。优先考虑 C 分配内存或 handle。
 
@@ -229,4 +239,3 @@ defer pinner.Unpin()
 - [Package unsafe](https://pkg.go.dev/unsafe)
 - [cgo command documentation](https://pkg.go.dev/cmd/cgo)
 - [Passing pointers](https://go.dev/wiki/cgo#passing-pointers)
-

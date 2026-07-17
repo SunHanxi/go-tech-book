@@ -84,7 +84,7 @@ func main() {
 
 **(1) 是什么**
 
-切片在内存中就是一个三字段结构体，称为 Slice Header。在 Go 1.21+ 的 runtime 源码里（`runtime/slice.go`），切片的内部表示是：
+切片的当前实现可概括为一个三字段描述符。下面是 Go 1.26 `runtime/slice.go` 的概念布局；语言规范保证切片语义，不保证用户代码可依赖私有字段：
 
 ```go
 // runtime/slice.go
@@ -153,7 +153,7 @@ slice:     [array, len=3, cap=8]
 
 **a) 字面量 `[]int{1,2,3}`**
 
-编译器先在只读数据段（如可能）或栈上生成一个临时数组，再用 `&arr[0]` 构造 header：
+编译器会根据元素是否为常量、后续是否修改以及逃逸结果，选择静态模板、栈上临时数组或堆分配，再构造 header。静态只读数据若要作为可修改切片使用，也需要复制到可写存储：
 
 ```go
 // []int{1, 2, 3} 等价伪代码
@@ -161,14 +161,14 @@ var arr = [3]int{1, 2, 3}
 s := slice{array: &arr[0], len: 3, cap: 3}
 ```
 
-若数组逃逸到堆，则等价于 `runtime.makeslice` + 元素写入。
+上面只表达语言效果，不代表固定 lowering。数组逃逸时通常需要堆分配；未逃逸时编译器可直接在栈帧中布置 backing store。
 
 **b) `make([]T, len, cap)`**
 
-直接调用 `runtime.makeslice`（或 `makeslicecopy`）：
+语义上需要一段 `cap*sizeof(T)` 的清零存储。编译器可在栈上生成，也可调用 `runtime.makeslice` / `makeslicecopy`：
 
 ```go
-// runtime/slice.go（Go 1.21，简化）
+// runtime/slice.go（Go 1.26，简化）
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
     mem, overflow := math.MulUintptr(et.size, uintptr(cap))
     if overflow || mem > maxAlloc || len < 0 || len > cap {
@@ -183,10 +183,12 @@ func makeslice(et *_type, len, cap int) unsafe.Pointer {
 }
 ```
 
-逐行解释：
+当走 Runtime 路径时：
 - `MulUintptr` 计算 `cap * sizeof(T)`，同时通过高位非零检测溢出。
 - 若 `mem` 超过单次最大分配 `maxAlloc`，或 `len` 越界，panic（区分 `len` 还是 `cap` 出问题，便于定位）。
 - `mallocgc(mem, et, true)` 分配并清零内存，`et` 携带 GC 需要的指针 bitmap。
+
+Go 1.26 扩大了可变大小 slice backing store 的栈分配范围，因此“cap 不是编译期常量就一定上堆”已经过时。是否上堆以当前工具链的 `-gcflags=all=-m=2` 输出和 alloc profile 为准；定位 Go 1.26 这项优化回归时可使用 bisect 的 `-compile=variablemake` 标记。
 
 **c) 切片表达式 `a[low:high]` / `s[low:high]`**
 
@@ -207,7 +209,7 @@ newSlice := slice{
 **(3) 工程实践与常见坑**
 
 - `make([]T, 0, 1024)` 预分配容量可避免多次扩容拷贝，是热点路径优化的常见手段。
-- 字面量创建的切片在元素数量大时会逃逸到堆。
+- 字面量 backing store 是否在堆上取决于大小、逃逸和编译器限制；“元素多就一定逃逸”不是语言规则。
 - 切片表达式第三参数 `a[i:j:k]` 用于"限制 cap = k-i"，是切断共享的关键技巧。
 - `make([]T, n)` 等价于 `make([]T, n, n)`，已分配 n 个零值元素。
 
@@ -255,7 +257,7 @@ func main() {
 
 **(1) 是什么**
 
-空切片是长度为 0 但**指针非 nil** 的切片，通常指向 `runtime.zerobase`：
+空的非 nil 切片长度为 0，但与 nil 切片的语言语义不同。当前实现通常让其数据指针指向 `runtime.zerobase` 或其他有效的零长度位置：
 
 ```go
 package main
@@ -273,9 +275,9 @@ func main() {
 
 **(2) 底层实现**
 
-- `[]int{}`：编译器把 `array` 指向 `runtime.zerobase`（一个全局的零字节对象），`len=cap=0`。
-- `make([]int, 0)`：`mallocgc(0, ...)` 也返回 `zerobase`，因此同样指向 zerobase。
-- 所以 nil 切片和空切片在 `len/cap` 上等价，区别仅在 `array` 指针是否为 nil。
+- `[]int{}` 和 `make([]int, 0)` 都必须得到非 nil 空切片；编译器可直接构造 header，不保证调用 `mallocgc`。
+- Go 1.26.4 常使用 `zerobase` 表示零大小存储，但具体地址不是公共契约。
+- nil 与非 nil 空切片在 `len/cap` 上相同，`s == nil`、反射和部分编码格式能观察到语义差异。
 
 **(3) 工程实践与常见坑**
 
@@ -286,7 +288,7 @@ func main() {
 | `append(s, x)` | 安全 | 安全 |
 | JSON Marshal | `null` | `[]` |
 | `fmt.Println(s)` | `[]` | `[]` |
-| 底层指针 | `nil` | `runtime.zerobase` |
+| 底层指针 | `nil` | 只保证代表非 nil 空切片；具体地址不属于语言契约 |
 
 > 写 API 时如果想保证 JSON 返回 `[]` 而不是 `null`，用 `[]int{}`；如果"无数据"语义上代表"未提供"，用 nil。两者在内部逻辑里几乎可互换，但在序列化、反射、与外部系统交互时差异明显。
 
@@ -297,16 +299,16 @@ func main() {
 每个非空切片都有一段底层数组支撑它。底层数组可能：
 
 - 是某个显式声明的 `[N]T` 数组；
-- 是 `makeslice` 在堆上分配的一段连续内存；
+- 是编译器在栈上布置或通过 `makeslice` 在堆上分配的一段连续内存；
 - 是另一个切片的底层数组（共享）。
 
-切片本身只是 header，GC 通过 header.array 追踪底层数组的存活。
+切片本身只是 header。若 backing store 在堆上，GC 通过可达指针追踪它；若在栈上，其生命周期受栈帧和逃逸规则管理。
 
 **(2) Runtime 视角**
 
-- `makeslice` 调用 `mallocgc` 分配 `cap*sizeof(T)` 字节，得到 `array` 指针。
+- 需要堆分配时，`makeslice` 调用 `mallocgc` 分配圆整后的存储并返回 `array` 指针；编译器证明不逃逸时可省去这条 Runtime 路径。
 - 这段内存像普通 Go 对象一样有 bitmap 标记指针位（若 T 含指针），供 GC 扫描；若 T 不含指针（如 `[]byte`），则不增加 GC 扫描负担。
-- 切片赋值/传参只复制 24 字节 header，底层数组不动，因此廉价。
+- 切片赋值/传参只复制 header，底层数组不动。header 在 64 位目标上通常为 24 字节，在 32 位目标上通常为 12 字节；具体 ABI 成本仍由目标平台决定。
 
 **(3) 工程实践与常见坑**
 
@@ -482,14 +484,14 @@ func main() {
 **(3) 工程实践与常见坑**
 
 - **NaN 坑**：`slices.Equal([]float64{math.NaN()}, []float64{math.NaN()})` 返回 false，因为 `NaN != NaN`。需要自定义相等用 `slices.EqualFunc`。
-- **性能**：对 `[]byte` 用 `bytes.Equal` 比 `slices.Equal` 更快（专门优化为 mempcmp，且能利用 SIMD）。
+- **性能**：`bytes.Equal` 明确表达字节比较，编译器和标准库都可为常见路径优化；`slices.Equal` 更通用。两者机器码和差距随工具链、长度分布与架构变化，热点用 benchmark 判断。
 - 配套函数：`slices.EqualFunc`（自定义比较）、`slices.Compare`（有序比较，返回 -1/0/1）、`slices.Clone`（深拷贝）、`slices.Contains`（成员检测）。
 
 ### 3.12 Slice 作为函数参数
 
 **(1) 是什么**
 
-传切片 = 传 24 字节 header 的副本。函数内对元素的修改对调用方可见，对 len/cap/array 的修改不可见。
+传切片会复制 header（当前 64 位实现通常 24 字节）。函数内通过共享 backing store 修改元素可被调用方观察；只改形参自己的 len/cap/array 字段不会替换调用方的 slice 变量。
 
 ```go
 package main
@@ -510,7 +512,7 @@ func main() {
 
 **(2) 底层原理**
 
-- 24 字节 header 通过寄存器或栈传递，几乎免费（Go ABI 中切片 header 可拆成 3 个寄存器参数）。
+- 当前寄存器 ABI 可把 header 拆到寄存器或栈槽中；这通常比复制元素便宜，但不是“免费”，具体还受内联、逃逸和目标架构影响。
 - header 里的 array 指针指向调用方的底层数组，所以 `s[i] = X` 改的是同一段内存。
 - `append` 可能分配新数组并改 header.array，但函数内的 header 是副本，调用方看不到。
 
@@ -518,41 +520,26 @@ func main() {
 
 - **append 必须返回**：标准写法 `s = append(s, x)`。
 - **想让函数扩容**：返回新切片 `func grow(s []int) []int`，或传指针 `func grow(s *[]int)`。
-- **大切片传参不要先取指针**：`*[]T` 反而失去 register 传参优化，直接传 `[]T` 即可。
-- **只读切片参数**：可以加文档注释"不修改 s"，但语言不强制；想强制可用 `slices.Clone` 复制后传，或传 `s` 的子串 `s[:len:len]` 限制 cap。
-- **接口转换**：切片赋值给 `any` 会触发逃逸到堆，热路径避免。
+- **通常直接传 `[]T`**：只有函数确实要替换调用者的 slice header 时才考虑 `*[]T`；性能差异需按目标 ABI 测量。
+- **只读切片参数**：文档约定“不得修改”不会被类型系统强制。需要隔离时传 `slices.Clone(s)`；`s[:len(s):len(s)]` 只限制 append 复用容量，仍可修改现有元素。
+- **接口转换**：切片赋值给 `any` 会构造接口值；是否让 slice header 或 backing array 逃逸取决于后续数据流，用 `-m=2` 验证。
 
 ### 3.13 Slice 的生命周期
 
 **(1) 是什么**
 
-切片 header 是值，但其底层数组是堆对象（一般情况）。底层数组的存活由"所有引用它的 header"共同决定，只要任一 header 还在用，数组就活。
+切片 header 是值，backing array 可位于静态区、栈或堆。对堆数组而言，只要仍有可达切片或其他指针引用它，数组就保持存活；对栈数组而言，编译器必须证明引用不会越过栈帧寿命，否则会把它移到堆上。
 
 **(2) 生命周期阶段**
 
 1. **创建**：`make` / 字面量 / 切片表达式 → 分配或复用底层数组。
 2. **使用**：`s[i]`、`range`、传参、append（cap 足够时原地写，不足时换数组）。
 3. **扩容**：append 触发 `growslice`，分配新数组 + 拷贝 + 更新 header.array。
-4. **死亡**：所有引用 header 都不可达时，底层数组被 GC 回收。
+4. **结束**：堆数组不可达后等待 GC 回收；栈 backing store 随栈帧生命周期复用。子切片可能让整个堆数组继续可达。
 
-**(3) growslice 简化伪代码（Go 1.21）**
+**(3) `growslice` 主线（Go 1.26.4）**
 
-```go
-// runtime/slice.go（简化）
-func growslice(oldPtr unsafe.Pointer, oldLen, oldCap int, num int, et *_type) slice {
-    newCap := nextslicecap(oldCap, num) // 计算新容量
-    // ... overflow 校验
-    var p unsafe.Pointer
-    if et.ptrdata == 0 {
-        p = mallocgc(capmem, nil, false) // 无指针类型，不需要 bitmap
-    } else {
-        p = mallocgc(capmem, et, true)
-        // 写入屏障：覆盖旧元素区，确保 GC 正确
-    }
-    memmove(p, oldPtr, lenmem)           // 拷贝旧元素
-    return slice{p, oldLen + num, newCap}
-}
-```
+当 `newLen > oldCap` 时，Runtime 先用 `nextslicecap(newLen, oldCap)` 计算理论容量，再按元素大小和是否含指针调用 `roundupsize`。无指针元素走 noscan 分配并只清理 append 不会覆盖的尾部；含指针元素分配可扫描的零值区域，并在复制旧指针时执行所需的批量写屏障。最后 `memmove` 旧元素并返回新的 `{array, len, cap}`。完整细节见[第4章 append](./04-append.md)。
 
 扩容规则（Go 1.18+，threshold 从 1024 调整为 256）：
 
@@ -561,14 +548,14 @@ func growslice(oldPtr unsafe.Pointer, oldLen, oldCap int, num int, et *_type) sl
 - 否则按 `newcap += (newcap + 3*256) / 4` 增长，渐近 1.25 倍；
 - 最后根据 `sizeof(T)` 和内存对齐做圆整，得到实际分配大小。
 
-| 旧 cap | 翻倍后 | 实际新 cap（近似） |
+| 旧 cap | `nextslicecap` 候选（追加 1 个） | 备注 |
 |---|---|---|
-| 1 | 2 | 2 |
-| 100 | 200 | 200 |
-| 256 | 512 | 512 |
-| 1000 | — | ~1250 |
+| 1 | 2 | 小容量翻倍 |
+| 100 | 200 | 小容量翻倍 |
+| 256 | 512 | 平滑公式在边界也得到 512 |
+| 1000 | 1442 | 最终 cap 还会按元素大小和 allocator 圆整 |
 
-> 扩容是切片性能的关键：知道大概容量时一定要 `make([]T, 0, n)` 预分配，避免 N 次 growslice 的 O(N²) 拷贝。
+> Go 1.26.4 当前的几何扩容让逐个 append 的总搬运量保持摊销 O(N)，不是 O(N²)；语言规范本身不固定增长公式。可信的容量 hint 仍可减少分配与复制，但严重高估会浪费内存。
 
 ### 3.14 Slice 导致的内存泄漏
 
@@ -603,7 +590,7 @@ b := make([]byte, 1<<20) // 1 MiB
 b = append(b[:0:0], b[:10]...) // cap=0 强制重新分配，避免共享旧 1 MiB
 ```
 
-`b[:0:0]` 是"截断到 0 容量"的经典技巧，append 必然分配新数组。
+`b[:0:0]` 把长度和容量都截为 0；随后只要 append 至少一个非零大小元素，结果就不能复用原容量。对零大小元素，Runtime 无需为元素载荷分配 backing store；单纯 `append(dst)` 没有新增元素时也不会触发增长。
 
 **(3) 经典场景三：切片作为 map value 长期持有**
 
@@ -616,10 +603,11 @@ cache["k"] = resp.Body // resp.Body 是大缓冲，cache 长期持有整段
 
 **(4) 经典场景四：字符串与切片的 unsafe 转换**
 
-`[]byte(s)` 会拷贝，但 `unsafe.String` / `unsafe.Slice` 系列会共享底层，要小心：
+安全的 `[]byte(s)` 转换保证结果可独立修改，编译器可在不可观察时消除物理拷贝；`unsafe.String` / `unsafe.Slice` 系列则显式共享底层，调用方必须维护不可变性与生命周期：
 
 ```go
-// 危险：s 的底层字符串只要活着，b 就能用；反过来 b 改了会影响 s
+// 只读视图：任何对 b 元素的写入都违反 unsafe.StringData 的契约，
+// 结果可能是数据损坏或崩溃；普通业务不要暴露这种 []byte。
 b := unsafe.Slice(unsafe.StringData(s), len(s))
 ```
 
@@ -634,7 +622,7 @@ func handler(resp []byte) func() {
 
 修复：闭包里只捕获必要的小拷贝。
 
-> 经验法则：**当切片来自外部、且你只用到一小段，就 `Clone` 一份**。Go 1.21 提供了 `slices.Clone` 和 `bytes.Clone`，没有理由不用。
+> 经验法则：外部大缓冲的一小段需要长期存活或跨所有权边界时，评估 `bytes.Clone` / `slices.Clone` 切断引用。短期同步读取通常无需复制；应结合保留时长、原缓冲大小和复制频率决定。
 
 ### 3.15 常见坑总结
 
@@ -650,7 +638,7 @@ func handler(resp []byte) func() {
 | 切片不能比较 | `a == b` 编译错 | 语言禁止 | `slices.Equal` |
 | 跨协程竞态 | 多协程写同切片 | 共享底层数组 | 加锁或 channel |
 | NaN 不等 | `slices.Equal([NaN],[NaN])` false | `NaN != NaN` | `slices.EqualFunc` |
-| 接口装箱逃逸 | 切片转 `any` 触发堆分配 | 接口要求可寻址 | 热路径避免装箱 |
+| 接口转换 | 切片转 `any` 后在某些调用链上逃逸 | 接口值跨越了当前可证明的生命周期 | 用 `-m=2` 定位，热路径按测量结果调整 |
 
 ```go
 package main
@@ -679,4 +667,4 @@ func main() {
 - 切片共享底层数组带来高效，也带来共享修改、内存泄漏、跨协程竞态三大坑。
 - `append` 可能换数组，所以"传参修改切片"必须返回或传指针。
 - 切片不能 `==`，用 `slices.Equal`（Go 1.21+）做元素相等比较。
-- 理解切片的关键模型：**header 在栈上、array 在堆上、多个 header 可指向同一 array**。
+- 理解切片的关键模型：**header 是值并含 array 指针；header 与 backing array 各自可能位于栈或堆，多个 header 可指向同一 array**。

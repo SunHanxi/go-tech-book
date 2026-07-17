@@ -204,7 +204,7 @@ Go 1.23 的两个关键变化：
 1. **可回收**：未到期、未 Stop 但已经不可达的 Timer/Ticker 可以被 GC 回收。
 2. **无陈旧值**：Stop/Reset 返回后，channel 不会交付旧配置的值。
 
-兼容开关 `GODEBUG=asynctimerchan=1` 在 Go 1.26 仍可恢复 Go 1.23 前的 buffered channel 与不可回收行为，仅应用于兼容排障，不应成为长期配置。
+兼容开关 `GODEBUG=asynctimerchan=1` 在 Go 1.26 仍可恢复 Go 1.23 前的 buffered channel 与不可回收行为，仅应用于兼容排障，不应成为长期配置。官方已说明该开关会在 Go 1.27 删除。
 
 源码里 `NewTimer` 仍可能创建容量为 1 的底层 channel，但 Runtime 对外呈现同步语义并在 channel 路径协作；不要只看 `time/sleep.go` 的 `make` 就推断 `cap(timer.C)` 或陈旧值行为。
 
@@ -217,9 +217,7 @@ Go 1.23 的两个关键变化：
 ```go
 func debounce(ctx context.Context, events <-chan Event, delay time.Duration) {
     timer := time.NewTimer(time.Hour)
-    if !timer.Stop() {
-        <-timer.C
-    }
+    timer.Stop()
     defer timer.Stop()
 
     var latest Event
@@ -271,4 +269,3 @@ func debounce(ctx context.Context, events <-chan Event, delay time.Duration) {
 - [Package time](https://pkg.go.dev/time)
 - [Go 1.23 Timer Channel Changes](https://go.dev/wiki/Go123Timer)
 - [Runtime timer source, Go 1.26](https://cs.opensource.google/go/go/+/refs/tags/go1.26.0:src/runtime/time.go)
-

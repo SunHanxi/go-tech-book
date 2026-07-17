@@ -36,10 +36,10 @@
 
 - [第12章 Goroutine](./12-Goroutine.md) — Scheduler、M/P/G、GMP、work stealing、抢占、netpoll
 - [第13章 Channel(重点)](./13-Channel.md) — hchan、有/无缓冲、close、range、select
-- [第14章 select(重点)](./14-select.md) — 语法、default、随机选择、公平性、Runtime 实现
-- [第15章 Context(重点)](./15-Context.md) — cancel/timeout/deadline/value、Context Tree
+- [第14章 select(重点)](./14-select.md) — 求值顺序、default、随机选择边界、Runtime 实现
+- [第15章 Context(重点)](./15-Context.md) — cancel/timeout/deadline/value、派生与取消传播
 - [第16章 Timer 与 Ticker](./16-Timer与Ticker.md) — Timer/After/AfterFunc、Ticker、Stop/Reset、Runtime Timer
-- [第17章 sync 包](./17-sync包.md) — Mutex、RWMutex、Once、Cond、WaitGroup、Pool、Atomic
+- [第17章 sync 包](./17-sync包.md) — Mutex、RWMutex、Once、Cond、WaitGroup、Pool、Map、Atomic
 - [第18章 Go 内存模型与数据竞争](./18-Go内存模型与数据竞争.md) — happens-before、安全发布、原子操作、race detector
 
 ### 第五篇 Runtime(重点)
@@ -60,7 +60,7 @@
 
 ### 第七篇 Kubernetes 源码中的 Go(重点)
 
-- [第29章 client-go](./29-client-go.md) — Informer、Reflector、DeltaFIFO、Indexer、SharedInformer
+- [第29章 client-go](./29-client-go.md) — Informer、Reflector、RealFIFO/DeltaFIFO、Indexer、SharedInformer
 - [第30章 Controller](./30-Controller.md) — Reconcile、WorkQueue、RateLimiter、Retry
 - [第31章 Operator](./31-Operator.md) — controller-runtime、Manager、Cache、Client、Webhook
 - [第32章 Prometheus Go Client](./32-Prometheus-Go-Client.md) — Collector、Registry、Gather、Exporter
