@@ -758,7 +758,7 @@ func main() {
 }
 ```
 
-要点回顾：handler 从 `r.Context()` 拿到根 ctx，注入 trace ID；`callUpstream` 派生带超时的子 ctx，并把它传给 HTTP client；任一层取消（客户端断开、超时、主动 cancel）都会级联到 `http.DefaultClient.Do`，中断底层连接。
+要点回顾：handler 从 `r.Context()` 拿到根 ctx，注入 trace ID；`callUpstream` 派生带超时的子 ctx，并把它传给 HTTP client；任一层取消（客户端断开、超时、主动 cancel）都会级联到 `http.DefaultClient.Do`，终止该请求的等待或读写。具体 Transport 可能关闭 HTTP/1.x 连接，也可能只重置 HTTP/2 流，不应依赖物理连接一定关闭。
 
 **常见反模式速查**
 

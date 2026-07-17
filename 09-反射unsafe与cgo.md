@@ -195,7 +195,7 @@ defer h.Delete()
 // 把 uintptr(h) 传给 C；回调时再由 Go 取回 h.Value()。
 ```
 
-确实需要 C 保留某块 Go 内存地址时可使用 `runtime.Pinner`：
+确实需要 C 保留某块 Go 内存地址时可使用 `runtime.Pinner`。以下是强调先注册、后注销、最后解除固定的生命周期伪代码：
 
 ```go
 var pinner runtime.Pinner
