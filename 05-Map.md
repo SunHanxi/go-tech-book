@@ -1,6 +1,6 @@
 ## 第5章 Map（重点）
 
-> 当前实现基线为 Go 1.26。Go 1.24 起，内置 map 默认使用位于 `internal/runtime/maps` 的 Swiss Table 实现。Go 1.23 及更早版本的 `hmap`、`bmap`、overflow bucket 和逐桶搬迁只在本章末尾作为历史对照。
+> 本章语言语义基线为 Go 1.26，源码快照基于 Go 1.26.4。Go 1.24 起，内置 map 默认使用位于 `internal/runtime/maps` 的 Swiss Table 实现。Go 1.23 及更早版本的 `hmap`、`bmap`、overflow bucket 和逐桶搬迁只在本章末尾作为历史对照。
 
 Map 的语言语义受 Go 1 兼容性保护，但内部结构不是公开 API。理解实现的目的，是解释性能和边界，不是让业务代码依赖 Runtime 字段。
 
@@ -24,6 +24,8 @@ delete(counts, "missing")        // 删除不存在的 key 也是安全的
 ```
 
 读取不存在的 key 返回 Value 的零值，因此需要区分“不存在”和“值恰好为零”时必须使用 comma-ok。
+
+注意 interface 类型的 key 只在编译期检查“接口类型本身可比较”。若插入或查找时动态类型不可比较（如 slice、map、func），会在运行时 panic（`hash of unhashable type`）。接口比较的完整规则见[第7章](./07-Interface.md)。
 
 ### 5.2 nil、clear 与可寻址性
 
@@ -286,14 +288,14 @@ func (s *SafeMap[K, V]) Store(key K, value V) {
 var m sync.Map
 
 actual, loaded := m.LoadOrStore("key", value)
-old, swapped := m.CompareAndSwap("key", actual, replacement)
+swapped := m.CompareAndSwap("key", actual, replacement) // 只返回 bool
 value, loaded := m.LoadAndDelete("key")
 m.Clear() // Go 1.23+
 ```
 
 `CompareAndSwap` / `CompareAndDelete` 的 old 必须可比较。`Range` 不是一致性快照：一次遍历可能观察到各 key 在不同时间点的值，回调返回 false 时停止；即便很早停止，API 仍允许其复杂度达到 O(N)。
 
-Go 1.26.4 的 `sync.Map` 是 `internal/sync.HashTrieMap[any, any]` 的包装，不再是旧资料中的 `read/dirty/miss` 双表。当前哈希 trie 的内部节点有原子发布的子指针：读取沿哈希路径遍历，修改锁住相关内部节点并发布新节点，哈希完全冲突时使用 overflow 链；`Clear` 通过替换根节点清空。内部结构不是兼容性承诺，选型仍应以公开语义和 benchmark 为准。
+Go 1.24 起 `sync.Map` 的默认实现切换为哈希 trie（HashTrieMap）；Go 1.26.4 中它是 `internal/sync.HashTrieMap[any, any]` 的包装，不再是旧资料中的 `read/dirty/miss` 双表。当前哈希 trie 的内部节点有原子发布的子指针：读取沿哈希路径遍历，修改锁住相关内部节点并发布新节点，哈希完全冲突时使用 overflow 链；`Clear` 通过替换根节点清空。内部结构不是兼容性承诺，选型仍应以公开语义和 benchmark 为准。
 
 `sync.Map` 的 key 必须可比较，且它没有 `Len`；涉及多 key 不变量、类型安全或一致性快照时，普通 `map[K]V` 配合锁通常更合适。
 
@@ -354,6 +356,23 @@ maps.DeleteFunc(clone, func(key string, value Item) bool {
 ```
 
 Map、slice、pointer、interface 作为 value 时，Clone 不复制其指向对象。
+
+**迭代器 API（Go 1.23+）**
+
+`maps` 包提供基于 `iter.Seq/Seq2` 的迭代器：`maps.All` 返回键值对迭代器（顺序仍未指定），`maps.Keys`/`maps.Values` 返回单值迭代器，`maps.Insert` 把 `iter.Seq2[K, V]` 写入已有 map，`maps.Collect` 把迭代器收集为新 map：
+
+```go
+evens := maps.Collect(func(yield func(int, string) bool) {
+    for i := 0; i < 6; i += 2 {
+        if !yield(i, strconv.Itoa(i)) {
+            return
+        }
+    }
+})
+maps.Insert(evens, maps.All(other)) // 合并 other，已有 key 被覆盖
+```
+
+它们与 `slices.Sorted(maps.Keys(m))` 等组合可省去中间 slice。迭代器语义详见[第8章](./08-现代类型系统与泛型.md)。
 
 **JSON**
 

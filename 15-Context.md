@@ -6,7 +6,7 @@
 
 **是什么**
 
-`context.Context` 是 Go 1.7 正式引入的标准库接口（更早源自 `golang.org/x/net/context`），它定义了在一个进程的 API 调用链中传递**截止时间、取消信号和请求级键值数据**的统一契约。Context 本身不可序列化，也不会自动跨进程传播；HTTP/RPC 库需将 deadline、trace 与身份等选定元数据显式编码到协议，并在服务端构造新 Context。Context 通常作为函数的第一个参数 `ctx context.Context` 显式传递，不存入长寿命业务结构。
+`context.Context` 是 Go 1.7 正式引入的标准库接口（更早源自 `golang.org/x/net/context`），它定义了在一个进程的 API 调用链中传递**截止时间、取消信号和请求级键值数据**的统一契约。Context 本身不可序列化，也不会自动跨进程传播；HTTP/RPC 库需将 deadline、trace 与身份等选定元数据显式编码到协议，并在服务端构造新 Context。传参与存放约定见本章末的最佳实践清单。
 
 接口自 Go 1.7 起保持稳定；下面对照 Go 1.26.4 的 `src/context/context.go`：
 
@@ -138,11 +138,13 @@ type cancelCtx struct {
 3. 遍历 `children`，递归 `cancel(false, err, cause)`（不再从父移除，因为父正在清理）。
 4. 若 `removeFromParent` 为 true，从父节点的 children 中移除自己。
 
-`propagateCancel(parent, child)`：在 `WithCancel` 时调用，把自己注册到父节点的 children（若父也是 cancelCtx 族且未取消）；若父已取消，则立即取消子节点。这是树形传播的关键：
+`propagateCancel`：在 `WithCancel` 时调用，把自己注册到父节点的 children（若父也是 cancelCtx 族且未取消）；若父已取消，则立即取消子节点。Go 1.21 起它从包级函数改为 `cancelCtx` 的方法 `(c *cancelCtx) propagateCancel(parent, child)`，并在其中完成 `c.Context = parent` 的父链接赋值。这是树形传播的关键：
 
 ```go
-// 简化的取消传播逻辑
-func propagateCancel(parent Context, child canceler) {
+// 简化的取消传播逻辑（Go 1.26.4 形态）
+func (c *cancelCtx) propagateCancel(parent Context, child canceler) {
+    c.Context = parent // 建立父链接
+
     done := parent.Done()
     if done == nil {
         return // 父永远不会取消，无需注册
@@ -325,26 +327,24 @@ func (c *timerCtx) cancel(removeFromParent bool, err, cause error) {
 `WithDeadline` 的核心逻辑：
 
 ```go
-func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
+// Go 1.21 起 WithDeadline 委托给 WithDeadlineCause(parent, d, nil)
+func WithDeadlineCause(parent Context, d time.Time, cause error) (Context, CancelFunc) {
     // 若父的 deadline 已经更早，直接返回一个 cancelCtx（无需额外 timer）
     if cur, ok := parent.Deadline(); ok && cur.Before(d) {
         return WithCancel(parent)
     }
-    c := &timerCtx{
-        cancelCtx: newCancelCtx(parent),
-        deadline:  d,
-    }
-    propagateCancel(parent, c) // 注册到父
+    c := &timerCtx{deadline: d}
+    c.cancelCtx.propagateCancel(parent, c) // 建立父链接并注册到父
     dur := time.Until(d)
     if dur <= 0 {
-        c.cancel(true, DeadlineExceeded, nil) // 已过期，立即取消
+        c.cancel(true, DeadlineExceeded, cause) // 已过期，立即取消
         return c, func() { c.cancel(false, Canceled, nil) }
     }
     c.mu.Lock()
     defer c.mu.Unlock()
     if c.err.Load() == nil {
         c.timer = time.AfterFunc(dur, func() {
-            c.cancel(true, DeadlineExceeded, nil) // 到点自动取消
+            c.cancel(true, DeadlineExceeded, cause) // 到点自动取消
         })
     }
     return c, func() { c.cancel(true, Canceled, nil) }
@@ -374,6 +374,82 @@ case context.Canceled:
     fmt.Println("被取消")
 }
 ```
+
+### AfterFunc 与 WithoutCancel（Go 1.21+）
+
+**是什么**
+
+Go 1.21 为 context 包新增了两个补齐生命周期表达能力的 API：
+
+```go
+func AfterFunc(ctx Context, f func()) (stop func() bool)
+func WithoutCancel(parent Context) Context
+```
+
+**AfterFunc：取消时执行回调**
+
+`AfterFunc(ctx, f)` 安排在 `ctx` 被取消后，在**独立 goroutine** 中调用 `f`；若 `ctx` 已经取消，则立即（仍在独立 goroutine 中）调用。多次对同一 ctx 调用 AfterFunc 相互独立，不会互相覆盖。
+
+返回的 `stop` 函数语义需要精确理解（对照 Go 1.26.4 文档）：
+
+- `stop()` 返回 `true`：成功解除关联，`f` 保证不会再被运行。
+- `stop()` 返回 `false`：要么 ctx 已取消且 `f` 已在自己的 goroutine 中**启动**，要么 `f` 已被先前的 stop 停止。
+- `stop` **不等待** `f` 执行完成；若调用方需要知道 `f` 是否已结束，必须自行与 `f` 协调（如 WaitGroup 或 done channel）。
+
+这与 `time.Timer.Stop` 的返回值语义同构。典型用途是把 Context 取消桥接到不认识 Context 的等待原语上，例如唤醒 `sync.Cond`：
+
+```go
+stop := context.AfterFunc(ctx, func() {
+    cond.Broadcast() // ctx 取消时唤醒等待者
+})
+defer stop()
+```
+
+标准库的 `propagateCancel` 也会优先利用父 Context 的 `AfterFunc(func()) func() bool` 方法来桥接自定义 Context 的取消信号，避免额外 goroutine（见上文 cancel 一节）。
+
+**WithoutCancel：脱离父取消的收尾工作**
+
+`WithoutCancel(parent)` 返回一个仍指向父节点的派生 Context：它保留父链上的全部 Value（trace ID、认证信息等继续可见），但**不会**随父取消——`Deadline()` 返回零值、`Err()` 恒为 nil、`Done()` 返回 nil channel、`Cause` 返回 nil。
+
+典型场景是"请求已结束，但收尾必须完成"的任务：写审计日志、上报 metrics、异步落盘。这些操作不应因请求 Context 取消而半途而废，但仍需要请求的元数据：
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    result := process(ctx)
+
+    // 收尾工作：脱离请求取消，但保留 trace 等 Value，并自设超时
+    bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+    go func() {
+        defer cancel()
+        auditLog(bgCtx, result)
+    }()
+}
+```
+
+注意 `WithoutCancel` 之后通常应重新加上自己的超时，否则收尾任务会失去一切时间约束。
+
+**context.Cause 在超时场景的行为**
+
+`Cause(ctx)` 优先返回取消时记录的 cause；超时场景下：
+
+```go
+// 普通 WithTimeout：cause 就是 DeadlineExceeded
+ctx1, cancel1 := context.WithTimeout(parent, time.Millisecond)
+defer cancel1()
+<-ctx1.Done()
+fmt.Println(context.Cause(ctx1)) // context deadline exceeded
+
+// WithDeadlineCause / WithTimeoutCause：deadline 到期时返回指定 cause
+ctx2, cancel2 := context.WithTimeoutCause(parent, time.Millisecond,
+    errors.New("配置中心响应预算耗尽"))
+defer cancel2()
+<-ctx2.Done()
+fmt.Println(ctx2.Err())          // context deadline exceeded（Err 不变）
+fmt.Println(context.Cause(ctx2)) // 配置中心响应预算耗尽
+```
+
+即 `Err()` 始终是标准哨兵错误（便于 `errors.Is` 判断），而 `Cause` 承载更具体的业务原因；注意 `WithDeadlineCause` / `WithTimeoutCause` 的 cause 只在 **deadline 到期**时生效，手动调用返回的 cancel 仍记录 `Canceled`。
 
 ### value
 

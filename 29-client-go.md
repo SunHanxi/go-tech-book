@@ -359,7 +359,7 @@ DeltaFIFO 的关键语义：
 - `dedupDeltas` 只检查最后两个 Delta，而且当前仅合并连续的 `Deleted, Deleted`，尽量保留信息更完整的删除对象。连续 `Updated, Updated` 不会被压缩。
 - `Replace` 为新列表逐项入队 `Replaced`（兼容选项关闭时为 `Sync`），并根据排队项与 `knownObjects` 为快照中消失的 key 生成 `DeletedFinalStateUnknown`。
 - `Resync` 遍历 `knownObjects`，只为当前尚未排队的 key 增加 `Sync`。
-- `Pop` 在锁内移除并调用 process；process 返回错误时，DeltaFIFO 只把错误返回给调用者，不会自动重入队。低层自定义消费者若要重试，必须明确调用 `AddIfNotPresent`。
+- `Pop` 在锁内移除并调用 process；process 返回错误时，DeltaFIFO 只把错误返回给调用者，不会自动重入队。历史版本（约 v0.31 及更早）曾支持 process 返回 `ErrRequeue` 触发 Pop 内部自动 `AddIfNotPresent` 重入队，v0.36 已删除 `ErrRequeue` 类型和 `AddIfNotPresent` 方法（`Queue` 接口注释中仍残留 ErrRequeue 字样，但无任何实现处理它）。低层自定义消费者若要重试，只能自行调用 `Add`/`Update` 重新入队，并接受由此产生的重复通知。
 - `initialPopulationCount` 统计首次 Replace 需要消费的 key 数；降到 0 后 `HasSynced` 才为 true。
 
 #### 工程实践与常见坑

@@ -47,6 +47,22 @@ type Handler struct {
 
 不要为每个 struct 预先创建一个镜像 interface。当调用方确实需要替换实现、隔离边界或表达稳定协议时再抽象。
 
+接口可以嵌入其他接口来组合方法集。Go 1.14 起，嵌入的接口允许方法集重叠——只要重复方法的签名一致即可：
+
+```go
+type ReadCloser interface {
+    io.Reader
+    io.Closer
+}
+
+type Session interface {
+    io.ReadCloser
+    io.WriteCloser // Close 与上一行重复：Go 1.14+ 合法
+}
+```
+
+Go 1.13 及更早版本中这种重叠是编译错误，`io.ReadWriteCloser` 等类型当年只能逐个方法展开声明。
+
 ### 7.2 方法集
 
 对定义类型 `T`：
@@ -192,6 +208,8 @@ if f, ok := writer.(Flusher); ok {
 ```
 
 这种小能力接口适合可选能力探测。但若能力是业务正确性的必备条件，应把它放进函数参数类型，不要到运行时才发现实现不完整。
+
+对 error 值做类型断言时，注意错误可能被 `fmt.Errorf("%w", ...)` 层层包装，直接 `err.(*ParseError)` 只检查最外层。`errors.As` 是沿 error 链逐层做类型断言的标准库封装，`errors.Is` 则是沿链的相等比较，应作为默认选择。详见[第23章 错误处理](./23-错误处理.md)。
 
 Type switch 把多个断言集中表达：
 

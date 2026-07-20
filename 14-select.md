@@ -43,6 +43,22 @@ case sink() <- payload():
 
 因此，不应把有副作用或昂贵计算藏在 case operand 中；先在 select 外明确求值通常更易审查。
 
+一个典型陷阱是把接收操作写进 send case 的 RHS：
+
+```go
+// 错误：<-other 在进入 select 时就同步求值。
+// 若 other 此刻无数据，整个 select 会阻塞在这次接收上，
+// 连 ctx.Done() 分支都不会被检查；
+// 若接收成功但最终 ch case 未中标，取出的值也已被丢弃。
+select {
+case ch <- <-other:
+case <-ctx.Done():
+    return ctx.Err()
+}
+```
+
+正确写法是拆成两步：先用一个 select 接收，再用另一个 select 发送，两步都监听取消。
+
 #### 空 select 与 nil channel
 
 `select {}` 没有任何 case，会永久阻塞当前 goroutine。它不会等待某个可关闭资源，也没有退出协议；服务主函数通常应等待信号并执行 graceful shutdown，而不是用空 select 代替生命周期管理。

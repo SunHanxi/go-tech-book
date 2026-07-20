@@ -42,7 +42,7 @@ for {
 _, err := io.Copy(destination, source)
 ```
 
-Writer 返回 `n < len(p)` 且 `err == nil` 违反契约，调用方会得到 `io.ErrShortWrite`。自定义 Reader/Writer 时必须写清阻塞、并发和所有权语义。
+Writer 返回 `n < len(p)` 且 `err == nil` 违反契约。注意 short write 并不会自动产生错误：是 `io.Copy` 等辅助函数在检测到 `n < len(p)` 时主动报告 `io.ErrShortWrite`；直接调用 `Write` 的代码必须自己检查 n。自定义 Reader/Writer 时必须写清阻塞、并发和所有权语义。
 
 ### 26.2 组合式 I/O
 
@@ -111,7 +111,7 @@ server := &http.Server{
 }
 ```
 
-Go 1.22 的 ServeMux 支持方法、通配符和 `Request.PathValue`。复杂路由仍可使用第三方库，但不应为了基本参数路由默认引入框架。
+Go 1.22 的 ServeMux 支持方法、通配符和 `Request.PathValue`。配套匹配规则需要了解：多个模式都能匹配时**最具体者胜**（如 `/items/latest` 优先于 `/items/{id}`）；两个模式互相冲突且无更具体者时，注册即 panic；`{path...}` 放在模式末尾可匹配剩余全部路径段；`{$}` 只匹配精确的根路径 `/`（裸 `/` 模式则匹配所有未被其他模式覆盖的路径）。复杂路由仍可使用第三方库，但不应为了基本参数路由默认引入框架。
 
 四个超时含义不同：
 

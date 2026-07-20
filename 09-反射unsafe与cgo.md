@@ -96,8 +96,11 @@ if field.CanSet() {
 ```go
 field, ok := reflect.TypeFor[User]().FieldByName("Name")
 if ok {
-    name, options := field.Tag.Lookup("json")
-    fmt.Println(name, options)
+    tag, present := field.Tag.Lookup("json") // 返回完整 tag 值与是否存在
+    if present {
+        name, options, _ := strings.Cut(tag, ",") // 再拆出名称与选项
+        fmt.Println(name, options)
+    }
 }
 ```
 
@@ -109,7 +112,7 @@ var plans sync.Map // map[reflect.Type]*fieldPlan
 
 缓存值必须不可变或自行同步。`reflect.Type` 可比较，适合作为 map key。
 
-Go 1.23 为 `Value` 增加 `Seq`/`Seq2`，Go 1.26 为结构字段和方法增加迭代 API。它们减少索引样板，但不会消除反射检查成本。
+Go 1.23 为 `Value` 增加 `Seq`/`Seq2`。Go 1.26 进一步增加迭代器 API：`Type.Fields`、`Type.Methods`、`Type.Ins`、`Type.Outs` 分别迭代结构体字段、方法集、函数入参与出参类型；`Value.Fields`、`Value.Methods` 迭代值的字段与方法，每次产出 `StructField`/`Method` 元数据与对应 `Value`。它们减少索引样板，但不会消除反射检查成本。
 
 ### 9.5 什么时候不用反射
 
@@ -148,6 +151,17 @@ func BytesToReadOnlyString(data []byte) string {
 
 反向把 string 暴露为可写 `[]byte` 是错误的，因为字符串可能位于只读内存。
 
+`unsafe.Pointer` 的文档枚举了六种合法转换模式，不属于这些模式的代码“今天可能非法，或将来会变非法”：
+
+1. `*T1` 经 `Pointer` 转为 `*T2`：要求 T2 不大于 T1 且内存布局等价（如 `math.Float64bits`）。
+2. `Pointer` 转 `uintptr`（但不转回）：仅用于打印等把地址当整数的场景。
+3. `Pointer` ↔ `uintptr` 带算术：指针偏移必须在同一表达式内完成，且结果仍指向原分配对象内部（优先用 `unsafe.Add`）。
+4. 调用 `syscall.Syscall` 类函数时把 `Pointer` 转 `uintptr`：转换必须直接出现在调用实参中，编译器据此保活对象。
+5. `reflect.Value.Pointer` / `UnsafeAddr` 的结果立即转回 `Pointer`：不能先存入 `uintptr` 变量。
+6. `reflect.SliceHeader` / `StringHeader` 的 `Data` 字段与 `Pointer` 互转：只能操作真实 slice/string 的 header，不能声明独立的 header 变量（这两个类型已 deprecated，新代码用 `unsafe.Slice`/`unsafe.String`）。
+
+`go vet` 能发现部分违反模式的用法，但沉默不代表正确。
+
 ### 9.7 `uintptr` 不是指针
 
 `uintptr` 只是整数，GC 不把它当作对象引用。不要跨语句、函数调用或阻塞点保存 Go 地址：
@@ -173,6 +187,18 @@ go vet ./...
 ### 9.8 cgo 调用与调度成本
 
 cgo 调用比普通 Go 调用昂贵，并涉及线程状态切换。长时间 C 调用不会占住 P，但可能持续占用 OS 线程；高频短调用则容易被边界成本主导。工程上应优先批量化，而不是逐元素跨边界。
+
+与 C 共享结构体布局时，不要假设 Go 编译器的字段排列永远与 C ABI 一致。Go 1.23 引入 `structs.HostLayout` 作为标准做法：包含该类型字段的 struct 按宿主（C ABI）期望布局，约定写成首个 `_` 字段：
+
+```go
+type CEvent struct {
+    _    structs.HostLayout
+    Kind uint32
+    Data *byte
+}
+```
+
+它只影响所在 struct 本身，不影响外层或嵌套 struct 字段。手写与 C 共享的 Go struct（syscall 参数块、共享内存、FFI）都应加上它。
 
 所有权必须明确：
 

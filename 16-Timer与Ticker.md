@@ -77,10 +77,9 @@ for {
 stopped := timer.Stop()
 ```
 
-- true：调用成功阻止一个仍活动的 Timer。
-- false：Timer 已到期、已停止，或回调已经开始。
+Go 1.26.4 文档的精确表述是：返回 true 表示本次调用停止了 timer；返回 false 表示 timer **已经到期或已被停止**。对 `AfterFunc` 创建的 timer，返回 false 意味着 f 已在自己的 goroutine 中启动（Stop 不等待 f 完成）。
 
-Go 1.23+ 对 `NewTimer` 创建的 channel timer 保证：Stop 返回后，后续接收不会拿到 Stop 之前的陈旧值。如果程序尚未接收且 Timer 仍在运行，Stop 保证返回 true。因此现代代码不需要在 Stop 返回 false 时排空 `timer.C`。
+Go 1.23+ 对 `NewTimer` 创建的 channel timer 保证：Stop 返回后，后续从 `t.C` 的接收保证阻塞、不会拿到 Stop 之前的陈旧值；如果程序尚未从 `t.C` 接收且 Timer 仍在运行，Stop 保证返回 true。因此现代代码不需要在 Stop 返回 false 时排空 `timer.C`。
 
 Go 1.22 及更早版本需要兼容以下旧模式：
 
@@ -150,6 +149,27 @@ for {
 
 Ticker 会调整间隔或丢弃 tick 以适应慢接收者，不会排队补发所有错过的时刻。不要用“收到 tick 的次数”表示可靠任务次数。
 
+两个容易忽略的细节：
+
+- **第一个 tick 在 d 之后到来，不是立即**。如果希望“先执行一次再进入周期”，惯用写法是把任务体提出来先调用一次，或在循环前手动执行：
+
+  ```go
+  ticker := time.NewTicker(interval)
+  defer ticker.Stop()
+
+  sample(time.Now()) // 立即执行第一次
+  for {
+      select {
+      case tick := <-ticker.C:
+          sample(tick)
+      case <-ctx.Done():
+          return
+      }
+  }
+  ```
+
+- **`ticker.C`（以及 `timer.C`）收到的时间值是触发时刻**，不是接收方实际取到值的时刻。慢接收者取到的值可能明显早于 `time.Now()`。
+
 `Ticker.Reset(d)` 修改周期，`d <= 0` 会 panic。`Ticker.Stop` 不关闭 C，接收循环必须同时监听 context 或其他结束信号。
 
 ### 16.8 time.Tick
@@ -163,6 +183,8 @@ for tick := range time.Tick(time.Minute) {
 ```
 
 Go 1.23+ 的 GC 可以回收不再可达的 Ticker，因此 `time.Tick` 不再因为缺少 Stop 必然泄漏。需要显式结束、修改周期或清晰表达资源所有权时仍应使用 `NewTicker`。
+
+注意 `d <= 0` 时的行为差异：`NewTicker` 和 `Ticker.Reset` 直接 panic，而 `time.Tick` 返回 **nil channel**——对它 `range` 或接收会永久阻塞而非报错。如果周期来自配置或计算，务必在调用前校验为正。
 
 ### 16.9 Runtime Timer
 
@@ -204,7 +226,7 @@ Go 1.23 的两个关键变化：
 1. **可回收**：未到期、未 Stop 但已经不可达的 Timer/Ticker 可以被 GC 回收。
 2. **无陈旧值**：Stop/Reset 返回后，channel 不会交付旧配置的值。
 
-兼容开关 `GODEBUG=asynctimerchan=1` 在 Go 1.26 仍可恢复 Go 1.23 前的 buffered channel 与不可回收行为，仅应用于兼容排障，不应成为长期配置。官方已说明该开关会在 Go 1.27 删除。
+兼容开关 `GODEBUG=asynctimerchan=1` 在 Go 1.26 仍可恢复 Go 1.23 前的 buffered channel 与不可回收行为，仅应用于兼容排障，不应成为长期配置。官方文档（`time.NewTimer`）的措辞是该开关"可能最早在 Go 1.27 移除"（may be removed in Go 1.27 or later），不应依赖它长期存在。
 
 源码里 `NewTimer` 仍可能创建容量为 1 的底层 channel，但 Runtime 对外呈现同步语义并在 channel 路径协作；不要只看 `time/sleep.go` 的 `make` 就推断 `cap(timer.C)` 或陈旧值行为。
 

@@ -1,6 +1,8 @@
 ## 第6章 String
 
 > 引言：String 是 Go 中看似简单却暗藏玄机的基础类型，它本质是一段只读字节序列的"头"，配合 UTF-8 与 rune，构成了 Go 文本处理的核心。
+>
+> 本章语言语义基线为 Go 1.26，源码快照基于 Go 1.26.4；string 的只读语义与 UTF-8 规则是语言契约，header 布局与转换优化是 gc 实现细节。
 
 ### 6.1 String Header
 
@@ -157,6 +159,8 @@ byte offset=5, rune=言
 **(3) 工程实践与常见坑**
 
 > 坑 1：string 不保证是合法 UTF-8。`string(b)` 其中 `b` 含任意字节时，`s` 仍是一个合法的 string，但 `utf8.ValidString(s)` 可能为 false。访问非法字节序列时 `utf8.DecodeRuneInString` 会返回 `U+FFFD`（替换字符）。
+>
+> 坑 1.1：`range` 遍历遇到非法 UTF-8 序列时，产出的 rune 是 `U+FFFD` 且只前进 **1 字节**（规范规定），因此一段连续坏字节会产出多个 `U+FFFD`。例如 `for i, r := range "a\xffb"` 依次得到 `(0, 'a')`、`(1, U+FFFD)`、`(2, 'b')`。注意 `U+FFFD` 也可能来自输入中真实存在的替换字符，不能反推原字节。
 
 > 坑 2：不能用 `s[i]` 取"第 i 个字符"，`s[i]` 是第 i 个**字节**。对中文做下标会切到多字节字符中间，得到一个非法的 byte。
 
@@ -190,7 +194,7 @@ import "fmt"
 
 func main() {
     var r rune = '中'
-    fmt.Printf("r = %d (U+%04X)\n", r, r) // r = 20013 (U+4E16)
+    fmt.Printf("r = %d (U+%04X)\n", r, r) // r = 20013 (U+4E2D)
     fmt.Printf("sizeof(rune) = %d\n", 4)  // 固定 4 字节
 }
 ```
@@ -278,7 +282,7 @@ func main() {
 
 > 坑 1：`byte('中')` 中的常量超出 `uint8` 表示范围，编译器会报 overflow；若先存入变量再执行 `byte(r)`，运行时转换才会丢弃高位。把 rune 转 byte 前应先检查范围，例如 `0 <= r && r <= 0x7f`。
 
-> 坑 2：`[]byte` 的零值是 `nil`，`string` 的零值是 `""`。`string(nil) == ""`、`[]byte("")` 返回非 nil 的空切片，注意二者转换在 nil 语义上的差异。
+> 坑 2：`[]byte` 的零值是 `nil`，`string` 的零值是 `""`。`string(nil)` 是编译错误（nil 无法转换为 string），但 `string([]byte(nil)) == ""` 成立；反向的 `[]byte("")` 在当前 gc 实现中返回非 nil 的空切片——这是实现行为而非规范保证，代码不应依赖其 nil 性，只应依赖 `len == 0`。
 
 ### 6.5 String 与 []byte
 
@@ -477,7 +481,7 @@ func (b *Builder) String() string {
 |------|------|
 | `WriteString(s string) (int, error)` | 追加字符串，对应 `io.StringWriter` 方法 |
 | `WriteByte(c byte) error` | 追加单字节 |
-| `WriteRune(r rune) (int, error)` | 追加一个 rune（自动 UTF-8 编码） |
+| `WriteRune(r rune) (int, error)` | 追加一个 rune（自动 UTF-8 编码）；非法 rune（负值或超出 U+10FFFF、surrogate 区）会被替换为 `U+FFFD` 写入，不返回错误 |
 | `Write([]byte) (int, error)` | 追加字节切片 |
 | `Len() int` | 当前字节数 |
 | `Cap() int` | 当前缓冲区容量 |

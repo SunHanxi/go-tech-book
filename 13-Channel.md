@@ -1,6 +1,6 @@
 ## 第13章 Channel（重点）
 
-> 引言：Channel 是 Go 并发模型的灵魂。它源自 Hoare 提出的 CSP（Communicating Sequential Processes）思想——"不要通过共享内存来通信，而要通过通信来共享内存"。本章从 `hchan` 的运行时结构出发，逐层剖析有缓冲/无缓冲 channel 的收发流程、`close` 与 `range` 的语义，并落到工程中的最佳实践与常见坑。读懂本章，是理解下一章 [select](./14-select.md) 的基础。
+> 引言：Channel 是 Go 并发模型的灵魂。它源自 Hoare 提出的 CSP（Communicating Sequential Processes）思想，Go 社区将其概括为一句谚语——"不要通过共享内存来通信，而要通过通信来共享内存"（出自 Effective Go / Rob Pike，并非 Hoare 原话）。本章从 `hchan` 的运行时结构出发，逐层剖析有缓冲/无缓冲 channel 的收发流程、`close` 与 `range` 的语义，并落到工程中的最佳实践与常见坑。读懂本章，是理解下一章 [select](./14-select.md) 的基础。
 
 ---
 
@@ -16,6 +16,12 @@ ch := make(chan int)      // 无缓冲
 ```
 
 Channel 支持三个核心操作：发送 `ch <- v`、接收 `v := <-ch`、关闭 `close(ch)`。多个 goroutine 可安全并发调用 channel 操作；但若传递的是指针、slice、map 等引用，channel 只同步交接时点，不会自动保护交接后仍被双方访问的底层对象。
+
+几条容易忽略的语言规则：
+
+- **单向转换**：双向 `chan T` 可以隐式转换为只发送 `chan<- T` 或只接收 `<-chan T`，反向转换不允许；方向限制发生在类型系统层面，运行时仍是同一个 channel。
+- **nil channel 的 `len`/`cap`**：对 nil channel 调用 `len`、`cap` 返回 0，不会 panic（收发才会永久阻塞，close 才会 panic）。
+- **channel 可比较**：channel 是可比较类型，`==` 比较的是是否为同一个 channel 对象（或都为 nil），因此可用作 map 的 key。
 
 #### 2. 为什么这样设计：CSP 模型与底层数据结构
 
@@ -136,7 +142,7 @@ type sudog struct {
 | `elemtype` | 元素类型，用于拷贝时的边界检查与 GC 扫描。 |
 | `sendx` / `recvx` | 环形缓冲的写/读游标，每次操作后对 `dataqsiz` 取模前进。 |
 | `recvq` / `sendq` | 因"接收不到"或"发不出去"而阻塞的 goroutine 链表，FIFO。 |
-| `lock` | 自旋锁（`runtime.mutex`），保护所有字段。channel 慢就慢在这把锁——高频收发会成为瓶颈。 |
+| `lock` | `runtime.mutex`，保护所有字段。它不是纯自旋锁：竞争时先短暂自旋，随后通过 OS 信号量/futex 挂起线程（见 `lock_spinbit.go` / `lock_futex.go`）。channel 慢就慢在这把锁——高频收发会成为瓶颈。 |
 
 `sudog` 的关键字段：
 
@@ -166,7 +172,7 @@ make(chan int, 3) 产生：
 
 #### 3. 工程实践与常见坑
 
-- **`chan struct{}` 是零成本信号**：`elemsize=0`，`buf` 不分配，`memmove` 跳过。适合做"事件通知 / done channel"。
+- **`chan struct{}` 是零载荷信号**：`elemsize=0`，不分配元素缓冲，收发跳过 `memmove`；但 channel 对象与同步、调度成本仍在，并非"零成本"。适合做"事件通知 / done channel"。
 - **`len(ch)` / `cap(ch)` 是 O(1)**：直接读 `qcount` / `dataqsiz`，但只是**瞬时快照**，不要用它做同步判断（如 `if len(ch) > 0 { <-ch }` 仍可能有竞争，应直接 `<-ch` 或用 `select`+`default`）。
 - **容量要从预算推导**：大 buffer 会预留元素存储并延长排队对象的存活，小 buffer 则更早施加背压。按允许的队列延迟、峰值、元素大小和下游吞吐设置，并用 profile 验证。
 - **channel 不是免费的锁**：每次收发要加 `hchan.lock` + 可能的 `memmove` + 可能的 goroutine 调度。高频路径上，`sync.Mutex` 保护一个 slice 通常更快。
@@ -248,8 +254,12 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool) bool {
     mysg.c = c
     c.sendq.enqueue(mysg)
     gopark(chanparkcommit, ...)   // 当前 goroutine 挂起
-    // 被唤醒后从这里继续
+    // 被唤醒后从这里继续：可能是接收者取走了数据，也可能是 close 唤醒
+    closed := !mysg.success
     releaseSudog(mysg)
+    if closed {
+        panic("send on closed channel") // close 唤醒的发送者在此 panic
+    }
     return true
 }
 ```
@@ -291,7 +301,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (received bool) {
 
 #### 3. 工程实践与常见坑
 
-- **缓冲大小是工程权衡**：太小 → 高频场景容易阻塞；太大 → 内存占用高、且会"延迟"对背压的感知。常见经验值是 `1` 或 `2`，真正需要削峰填谷时再加大。
+- **缓冲大小是工程权衡**：太小 → 高频场景容易阻塞；太大 → 内存占用高、且会"延迟"对背压的感知。容量应从允许的排队延迟、峰值流量、元素大小与内存预算推导，并用 profile 验证，不存在通用经验值。
 - **有缓冲 ≠ 解耦**：很多人以为"加了缓冲就不会阻塞"，错。buf 一旦满了发送方照样阻塞。要做真正的解耦，配合 `select`+`default` 或 `context` 主动放弃。
 - **FIFO 但不保证强实时**：channel 保证元素**进入 buf 的顺序 = 离开 buf 的顺序**，但不保证"发送返回"和"接收方处理完"的时序——这是异步语义。
 - **不要用 `len(ch) == cap(ch)` 做判断**：仍是瞬时快照，多 goroutine 下不可靠。
@@ -359,7 +369,7 @@ goroutine B: x := <-ch
 
 **happened-before 关系：**
 
-内存模型保证：发送操作 synchronizes-before 对应接收完成；对无缓冲 channel，对应接收还 synchronizes-before 发送完成。因此 send 前的写对 receive 后的读可见，但这不会保护双方在交接后继续并发修改同一个引用对象。
+内存模型保证：发送操作 synchronizes-before 对应接收完成；对无缓冲 channel，对应接收还 synchronizes-before 发送完成。因此 send 前的写对 receive 后的读可见，但这不会保护双方在交接后继续并发修改同一个引用对象。对容量为 C 的有缓冲 channel，还有一条对称规则：第 k 次接收 synchronizes-before 第 k+C 次发送完成——这正是"用容量 C 的 channel 做信号量"的内存模型依据（详见第18章）。
 
 ```
 A: v = 42; ch <- v;        // A 写 v 在 send 之前
@@ -434,9 +444,13 @@ func closechan(c *hchan) {
     for {
         sg := c.recvq.dequeue()
         if sg == nil { break }
-        sg.elem = nil                     // 标记：收到的是零值
+        if sg.elem != nil {
+            typedmemclr(c.elemtype, sg.elem) // 先把接收变量清成零值
+            sg.elem = nil                    // 再断开引用
+        }
+        sg.success = false                // 标记：不是真正的收发完成
         gp := sg.g
-        gp.param = nil
+        gp.param = unsafe.Pointer(sg)
         glist.push(gp)
     }
     // 2. 唤醒所有发送等待者：他们会被 panic
@@ -444,8 +458,9 @@ func closechan(c *hchan) {
         sg := c.sendq.dequeue()
         if sg == nil { break }
         sg.elem = nil
+        sg.success = false
         gp := sg.g
-        gp.param = nil
+        gp.param = unsafe.Pointer(sg)
         glist.push(gp)
     }
     unlock(&c.lock)
@@ -463,8 +478,8 @@ func closechan(c *hchan) {
 
 - **置 `closed=1` 在锁内**：与 `chansend` 的 `c.closed != 0` 检查互斥，避免 close 与 send 竞争。
 - **批量唤醒**：所有等待者先收集到 `glist`，释放锁后再 `goready`，缩短锁持有时间。
-- **发送等待者也会被唤醒**：但它们的 `chansend` 在 `gopark` 返回后会发现 `c.closed != 0`，于是 panic——这就是"向已关闭 channel 发送会 panic"的运行时根源。
-- **接收者得到零值**：`close` 时如果 `recvq` 上有人，他们的 `sudog.elem` 被置 nil，唤醒后 `chanrecv` 走零值路径。
+- **发送等待者也会被唤醒**：但它们的 `sudog.success` 被置为 `false`，`chansend` 在 `gopark` 返回后据此 panic——这就是"向已关闭 channel 发送会 panic"的运行时根源。
+- **接收者得到零值**：`close` 时如果 `recvq` 上有人，Runtime 先对其接收变量 `typedmemclr` 清零，再把 `sudog.elem` 置 nil；唤醒后 `chanrecv` 返回零值和 `ok=false`。
 
 #### 3. 工程实践与常见坑
 
@@ -639,7 +654,7 @@ default:
 
 - **阻塞**直到至少一个 case 就绪（除非有 `default`）；
 - 若多个 case 同时就绪，**随机**选一个执行；
-- 每个 case 的操作与对应分支体**原子地**完成（其他 case 不会被同时执行）。
+- 一次 `select` 只执行被选中 case 的那一次通信及其分支体；通信本身在 channel 锁保护下互斥完成，但分支体只是普通代码，没有任何原子性保证。
 
 #### 2. 为什么这样设计
 
@@ -674,7 +689,7 @@ default:
 - **超时控制**：`case <-time.After(d)` 是最常用的模式，避免 goroutine 永久阻塞。
 - **非阻塞收发**：`default` 分支让 select 立即返回，常用于"有就处理、没有就跳过"。
 - **动态禁用 case**：把 channel 变量置 `nil`，对应 case 永久阻塞，等价于"从 select 中移除"。
-- **空 select `select{}`**：永久阻塞，常用于让 main goroutine 等待信号（避免泄漏的 goroutine 退出前 main 退出）。
+- **空 select `select{}`**：没有任何 case，当前 goroutine 永久阻塞。工程上应优先用可退出的等待（如监听信号 channel 或 `ctx.Done()`）实现 graceful shutdown，`select{}` 只适合"永不退出"的极少数场景（详见第14章）。
 
 > `select` 的完整原理（求值规则、`scase`、`selectgo` 和随机选择边界）见 [第14章 select](./14-select.md)。
 

@@ -16,7 +16,7 @@ import "fmt"
 func main() {
     s := []int{10, 20, 30}
     s = append(s, 40)
-    fmt.Println(s, len(s), cap(s)) // [10 20 30 40] 4 (8 或更大)
+    fmt.Println(s, len(s), cap(s)) // [10 20 30 40] 4 6（cap 是实现结果，随版本/平台可能不同）
 }
 ```
 
@@ -78,7 +78,7 @@ func main() {
   s := a[1:3:3] // len=2, cap=2，禁止向右扩展，append 会重新分配
   ```
 
-- 数组指针 `(*[5]int)(&arr)` 也可切片，常用于避免数组值拷贝。
+- 数组指针也可以直接切片：`p := &arr; s := p[1:3]` 等价于 `arr[1:3]`，常用于在函数间传 `*[N]T` 避免数组值拷贝后再按需开窗口。
 
 ### 3.3 Slice Header（ptr、len、cap）
 
@@ -98,7 +98,8 @@ type slice struct {
 对外（`reflect` 包）等价表示为：
 
 ```go
-// reflect/value.go（外部可见版本，仅用于理解）
+// reflect/value.go（外部可见版本，仅作理解用）
+// 自 Go 1.21 起已标记 Deprecated：生产代码请用 unsafe.Slice / unsafe.SliceData
 type SliceHeader struct {
     Data uintptr
     Len  int
@@ -170,10 +171,10 @@ s := slice{array: &arr[0], len: 3, cap: 3}
 ```go
 // runtime/slice.go（Go 1.26，简化）
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
-    mem, overflow := math.MulUintptr(et.size, uintptr(cap))
+    mem, overflow := math.MulUintptr(et.Size_, uintptr(cap))
     if overflow || mem > maxAlloc || len < 0 || len > cap {
         // 二次校验 len，区分 len / cap 越界两种 panic
-        mem, overflow := math.MulUintptr(et.size, uintptr(len))
+        mem, overflow := math.MulUintptr(et.Size_, uintptr(len))
         if overflow || mem > maxAlloc || len < 0 {
             panicmakeslicelen()
         }
@@ -188,7 +189,7 @@ func makeslice(et *_type, len, cap int) unsafe.Pointer {
 - 若 `mem` 超过单次最大分配 `maxAlloc`，或 `len` 越界，panic（区分 `len` 还是 `cap` 出问题，便于定位）。
 - `mallocgc(mem, et, true)` 分配并清零内存，`et` 携带 GC 需要的指针 bitmap。
 
-Go 1.26 扩大了可变大小 slice backing store 的栈分配范围，因此“cap 不是编译期常量就一定上堆”已经过时。是否上堆以当前工具链的 `-gcflags=all=-m=2` 输出和 alloc profile 为准；定位 Go 1.26 这项优化回归时可使用 bisect 的 `-compile=variablemake` 标记。
+Go 1.25 扩大了可变大小 slice backing store 的栈分配范围，因此“cap 不是编译期常量就一定上堆”已经过时。是否上堆以当前工具链的 `-gcflags=all=-m=2` 输出和 alloc profile 为准；定位 Go 1.25 这项优化引起的回归时可使用 bisect 的 `-compile=variablemake` 标记。
 
 **c) 切片表达式 `a[low:high]` / `s[low:high]`**
 
@@ -250,7 +251,7 @@ func main() {
 **(3) 工程实践与常见坑**
 
 - **JSON 坑**：API 返回 `var s []int` 序列化为 `null`；想返回 `[]` 应显式 `s := []int{}`。
-- **reflect 坑**：`reflect.ValueOf(s).IsNil()` 对 nil 切片返回 true，对空切片 panic（空切片非 nil）；调用前先判断 `Kind() == Slice`。
+- **reflect 坑**：`reflect.ValueOf(s).IsNil()` 对 nil 切片返回 true，对非 nil 空切片返回 false；只有对 `Kind` 不支持 nil 的值（如 int、struct）调用 `IsNil` 才会 panic，必要时先判断 `Kind() == reflect.Slice`。
 - **迭代坑**：`for range nilSlice` 不执行循环体，安全；无需额外判空。
 
 ### 3.6 Empty Slice
@@ -348,7 +349,7 @@ func main() {
 **(3) 工程实践与常见坑**
 
 - **隐式共享坑**：`b := a` 后改 `b` 影响 `a`，初学者常踩。
-- **append 截断共享**：`b := append([]T(nil), a...)` 是传统的"深拷贝切片"写法；Go 1.21+ 应直接用 `slices.Clone(a)`。
+- **append 截断共享**：`b := append([]T(nil), a...)` 是传统的"复制出独立切片"写法；Go 1.21+ 应直接用 `slices.Clone(a)`。注意两者都是**浅拷贝**：只复制元素本身，元素若是指针或含指针的结构，指向的对象仍然共享。
 - **跨协程共享**：多个 goroutine 同时读写同一段底层数组是 data race，需要同步（mutex 或 channel）。
 - **三参数切片** `a[i:j:k]` 限制 cap = k-i，防止 append 越界写入共享区域。
 - 切片传给 `sort.Slice` / `sort.Ints` 是就地排序，原切片顺序会被改。
@@ -430,7 +431,7 @@ Go 规范明确禁止切片比较，原因有三：
 - 比较是否同底层数组：`&a[0] == &b[0]`（要确保 len>0）。
 - 比较元素是否相等：用 `slices.Equal`（见 3.11）。
 - 想把"切片内容"做 map key：先转字符串（`string(b)` 对 `[]byte` 合法且拷贝）或哈希后再用。
-- `[]byte` 可以与 `string` 比较：`string(b) == "abc"`，因为这是语言内建的特殊规则（隐式转换）。
+- `[]byte` 与 `string` 的比较写作 `string(b) == "abc"`：`string(b)` 是显式转换；在这类"转换结果只用于比较、不逃逸"的场景，编译器可以免除临时字符串的分配。
 
 ### 3.11 slices.Equal
 
@@ -485,7 +486,7 @@ func main() {
 
 - **NaN 坑**：`slices.Equal([]float64{math.NaN()}, []float64{math.NaN()})` 返回 false，因为 `NaN != NaN`。需要自定义相等用 `slices.EqualFunc`。
 - **性能**：`bytes.Equal` 明确表达字节比较，编译器和标准库都可为常见路径优化；`slices.Equal` 更通用。两者机器码和差距随工具链、长度分布与架构变化，热点用 benchmark 判断。
-- 配套函数：`slices.EqualFunc`（自定义比较）、`slices.Compare`（有序比较，返回 -1/0/1）、`slices.Clone`（深拷贝）、`slices.Contains`（成员检测）。
+- 配套函数：`slices.EqualFunc`（自定义比较）、`slices.Compare`（有序比较，返回 -1/0/1）、`slices.Clone`（浅拷贝出独立 backing array）、`slices.Contains`（成员检测）。
 
 ### 3.12 Slice 作为函数参数
 
